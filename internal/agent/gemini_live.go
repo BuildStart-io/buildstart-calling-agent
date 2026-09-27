@@ -36,6 +36,8 @@ type GeminiLiveAgent struct {
 	greetingTriggered atomic.Bool
 	greetingPending   atomic.Bool
 	callActive        atomic.Bool
+	interruptedThisTurn atomic.Bool
+	isModelSpeaking     atomic.Bool
 	wsMu              sync.Mutex
 	resampleMu        sync.Mutex
 	resampler         *media.Resampler24kTo16k
@@ -142,9 +144,9 @@ TURN 1 — YOUR OPENING GREETING:
   (MANDATORY: STOP immediately after saying "හෙලෝ"! Do NOT introduce yourself yet. You MUST wait for the caller to reply.)
 
 TURN 2 — AFTER CALLER RESPONDS TO YOUR GREETING (e.g. caller says "hello", "ow", "kawda me", "හෙලෝ"):
-  State your identity and purpose clearly:
-  "මම Hasini — Buildstart එකෙන්. ඔයා අපේ WhatsApp AI agent system එක ගැන inquiry එකක් කළා නේද — ඒ ගැන කතා කරන්න call කළේ. දැන් ටිකක් කතා කරන්න පුළුවන්ද?"
-  (RULE: Do NOT use "සර්" or "මැඩම්" yet! Since the caller only said a short greeting, gender cannot be determined accurately yet.)
+  State your identity in ONE short, crisp sentence (under 14 words):
+  "මම Buildstart එකෙන් Hasini. ඔයා අපේ WhatsApp AI එක ගැන inquiry එකක් දැම්මා නේද? දැන් විනාඩියක් කතා කරන්න පුළුවන්ද?"
+  (RULE: Do NOT use "සර්" or "මැඩම්" yet! Keep it short and stop immediately to let the caller answer.)
 
 TURN 3 & ONWARDS — ONCE THE CALLER SPEAKS A LENGTHIER SENTENCE (e.g. explains whether they can talk, their business type, or asks questions):
   Now listen carefully to their voice pitch and speech:
@@ -221,6 +223,10 @@ func (g *GeminiLiveAgent) readLoop() {
 
 		var resp struct {
 			SetupComplete *struct{} `json:"setupComplete"`
+			VoiceActivity *struct {
+				Type        string `json:"type"`
+				AudioOffset string `json:"audioOffset"`
+			} `json:"voiceActivity"`
 			ServerContent *struct {
 				// Audio may come in modelTurn.parts OR directly in serverContent.parts
 				Parts []struct {
@@ -254,6 +260,22 @@ func (g *GeminiLiveAgent) readLoop() {
 			continue
 		}
 
+		// Instant barge-in: cut agent speech the exact moment the caller starts speaking
+		if resp.VoiceActivity != nil && resp.VoiceActivity.Type == "ACTIVITY_START" {
+			if g.isModelSpeaking.Load() {
+				g.log.Info("Gemini detected caller voice (ACTIVITY_START while agent speaking) — cutting agent voice immediately")
+				g.interruptedThisTurn.Store(true)
+				g.isModelSpeaking.Store(false)
+				if g.OnInterrupt != nil {
+					g.OnInterrupt()
+				}
+				g.resampleMu.Lock()
+				g.resampler.Reset()
+				g.dsp.Reset()
+				g.resampleMu.Unlock()
+			}
+		}
+
 		// DEBUG: log raw Gemini message (truncated) to diagnose silent audio
 		if len(data) > 0 {
 			preview := string(data)
@@ -276,9 +298,11 @@ func (g *GeminiLiveAgent) readLoop() {
 			continue
 		}
 
-		// Handle user barge-in / interruption
+		// Handle user barge-in / interruption from serverContent
 		if sc.Interrupted {
 			g.log.Info("Gemini detected caller interruption (barge-in)")
+			g.interruptedThisTurn.Store(true)
+			g.isModelSpeaking.Store(false)
 			if g.OnInterrupt != nil {
 				g.OnInterrupt()
 			}
@@ -314,6 +338,11 @@ func (g *GeminiLiveAgent) readLoop() {
 
 		// Stream 24 kHz audio chunks — audio may arrive in sc.Parts OR sc.ModelTurn.Parts
 		processAudioPart := func(data string) {
+			if g.interruptedThisTurn.Load() {
+				return // Discard audio chunks from interrupted turn
+			}
+			g.isModelSpeaking.Store(true)
+
 			g.latMu.Lock()
 			if !g.loggedLatencyThisTurn && !g.lastCallerAudioAt.IsZero() {
 				latMs := time.Since(g.lastCallerAudioAt).Milliseconds()
@@ -370,6 +399,8 @@ func (g *GeminiLiveAgent) readLoop() {
 		}
 
 		if sc.TurnComplete {
+			g.isModelSpeaking.Store(false)
+			g.interruptedThisTurn.Store(false)
 			g.latMu.Lock()
 			g.loggedLatencyThisTurn = false
 			g.latMu.Unlock()
