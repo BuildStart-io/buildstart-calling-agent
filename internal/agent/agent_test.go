@@ -89,3 +89,41 @@ func TestTTSFallbackTone(t *testing.T) {
 		t.Fatalf("expected non-empty PCM samples")
 	}
 }
+
+func TestGeminiLiveAudioIngestion(t *testing.T) {
+	agent := NewGeminiLiveAgent("fake-key", "", "Aoede", "You are an assistant.", nil)
+	defer agent.Close()
+
+	if !agent.IsEnabled() {
+		t.Fatalf("expected agent to be enabled by default")
+	}
+
+	frame := make([]float32, 960) // 60ms @ 16kHz
+	for i := range frame {
+		frame[i] = 0.25
+	}
+
+	// When call is not active, FeedCallerAudio should ignore frames
+	agent.SetCallActive(false)
+	agent.FeedCallerAudio(frame)
+	if len(agent.audioInCh) != 0 {
+		t.Fatalf("expected 0 frames in audioInCh when callActive is false, got %d", len(agent.audioInCh))
+	}
+
+	// When call is active, FeedCallerAudio should enqueue frames cleanly
+	agent.SetCallActive(true)
+	agent.FeedCallerAudio(frame)
+	if len(agent.audioInCh) != 1 {
+		t.Fatalf("expected 1 frame in audioInCh when callActive is true, got %d", len(agent.audioInCh))
+	}
+
+	received := <-agent.audioInCh
+	if len(received) != 960 {
+		t.Fatalf("expected 960 samples, got %d", len(received))
+	}
+	for i, s := range received {
+		if s != 0.25 {
+			t.Fatalf("sample %d corrupted: got %f, want 0.25", i, s)
+		}
+	}
+}
