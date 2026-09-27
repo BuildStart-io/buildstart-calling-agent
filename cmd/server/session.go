@@ -243,16 +243,6 @@ func (s *Session) wireCall(cm *call.CallManager, callID string) {
 		ac.peerAudioReceived = true
 		ac.broadcastAudio(pcm16)
 
-		// Full Acoustic Echo Gating:
-		// When the agent is speaking out loud through the phone speaker,
-		// the phone's microphone picks up the speaker output and bounces it back.
-		// If forwarded to Gemini Live, Gemini's VAD triggers on its own echo,
-		// causing it to stay in "listening" state, hallucinate garbled user speech,
-		// and add multi-second delays before answering.
-		if ac.cm != nil && ac.cm.IsPlayingAudio() {
-			return
-		}
-
 		if ac.geminiLive != nil && ac.geminiLive.IsEnabled() {
 			ac.geminiLive.FeedCallerAudio(pcm16)
 		}
