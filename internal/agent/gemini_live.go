@@ -260,20 +260,9 @@ func (g *GeminiLiveAgent) readLoop() {
 			continue
 		}
 
-		// Instant barge-in: cut agent speech the exact moment the caller starts speaking
-		if resp.VoiceActivity != nil && resp.VoiceActivity.Type == "ACTIVITY_START" {
-			if g.isModelSpeaking.Load() {
-				g.log.Info("Gemini detected caller voice (ACTIVITY_START while agent speaking) — cutting agent voice immediately")
-				g.interruptedThisTurn.Store(true)
-				g.isModelSpeaking.Store(false)
-				if g.OnInterrupt != nil {
-					g.OnInterrupt()
-				}
-				g.resampleMu.Lock()
-				g.resampler.Reset()
-				g.dsp.Reset()
-				g.resampleMu.Unlock()
-			}
+		// Voice activity diagnostics from Gemini Live VAD
+		if resp.VoiceActivity != nil {
+			g.log.Info("Gemini Live VAD voice activity", "type", resp.VoiceActivity.Type, "offset", resp.VoiceActivity.AudioOffset)
 		}
 
 		// DEBUG: log raw Gemini message (truncated) to diagnose silent audio

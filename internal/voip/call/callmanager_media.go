@@ -27,13 +27,24 @@ func (m *CallManager) FeedCapturedPCM(data []float32) {
 	defer m.mu.Unlock()
 	m.playQueue = append(m.playQueue, data...)
 	m.lastCaptureAt = time.Now()
+	m.lastPlayingAt = time.Now()
 }
 
 func (m *CallManager) FlushCapturedPCM() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.playQueue = nil
+	m.wasPlaying = false
 	m.wasSilent = true
+	m.lastPlayingAt = time.Time{}
+}
+
+// IsPlayingAudio returns true if the call is actively transmitting agent speech to the peer,
+// or has finished transmitting within a 350ms cooldown window to absorb room and phone speaker acoustic echo.
+func (m *CallManager) IsPlayingAudio() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.wasPlaying || len(m.playQueue) > 0 || (!m.lastPlayingAt.IsZero() && time.Since(m.lastPlayingAt) < 350*time.Millisecond)
 }
 
 func (m *CallManager) sendOpusFrameLocked(opus []byte) {
@@ -99,6 +110,7 @@ func (m *CallManager) dispatchAudioFrameLocked(frame, silence []float32, frameSi
 	if !m.wasPlaying {
 		if len(m.playQueue) >= prebufferSamples {
 			m.wasPlaying = true
+			m.lastPlayingAt = time.Now()
 			copy(frame, m.playQueue[:frameSize])
 			m.playQueue = m.playQueue[frameSize:]
 			m.wasSilent = false
@@ -117,6 +129,7 @@ func (m *CallManager) dispatchAudioFrameLocked(frame, silence []float32, frameSi
 
 	// While actively playing:
 	if len(m.playQueue) >= frameSize {
+		m.lastPlayingAt = time.Now()
 		copy(frame, m.playQueue[:frameSize])
 		m.playQueue = m.playQueue[frameSize:]
 		m.wasSilent = false
@@ -125,6 +138,7 @@ func (m *CallManager) dispatchAudioFrameLocked(frame, silence []float32, frameSi
 		}
 	} else if time.Since(m.lastCaptureAt) > 400*time.Millisecond {
 		// Gemini turn has finished: flush trailing samples and return to idle
+		m.lastPlayingAt = time.Now()
 		if len(m.playQueue) > 0 {
 			n := len(m.playQueue)
 			copy(frame, m.playQueue)
@@ -147,6 +161,7 @@ func (m *CallManager) dispatchAudioFrameLocked(frame, silence []float32, frameSi
 	} else {
 		// Temporary jitter pause while Gemini is still streaming:
 		// PRESERVE playQueue so partial syllables are NEVER destroyed!
+		m.lastPlayingAt = time.Now()
 		if opus, err := m.codec.Encode(silence); err == nil {
 			m.sendOpusFrameLocked(opus)
 		}

@@ -46,6 +46,7 @@ type CallManager struct {
 	wasPlaying  bool
 
 	lastCaptureAt  time.Time
+	lastPlayingAt  time.Time
 	keepaliveStop  chan struct{}
 	outPacketCount int
 
