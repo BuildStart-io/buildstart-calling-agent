@@ -28,7 +28,7 @@ const defaultConfig: AgentConfigData = {
   hasKey: false,
   model: "openrouter/auto",
   systemPrompt: "ඔබ ඉතා දක්ෂ, මිත්‍රශීලී සහ කාරුණික AI හඬ සහායකයෙකි. ඔබ සජීවී WhatsApp දුරකථන ඇමතුමකට පිළිතුරු දෙයි. සැමවිටම ඉතා පැහැදිලි, ස්වාභාවික සහ කාරුණික කතාබහ කරන සිංහල භාෂාවෙන් (හෝ අමතන්නා ඉංග්‍රීසියෙන් කතා කළහොත් ඉංග්‍රීසියෙන්) ඉතා කෙටියෙන් (වාක්‍ය 1-2 කින්) පිළිතුරු දෙන්න. කිසිවිටෙකත් markdown, bullet points, තරු ලකුණු හෝ emojis භාවිතා නොකරන්න. කටහඬින් කතා කරන ආකාරයටම ස්වාභාවිකව පිළිතුරු දෙන්න.",
-  voice: "si-LK-ThiliniNeural",
+  voice: "dialog-nipunika",
 };
 
 export const useAgentStore = create<State>((set, get) => ({

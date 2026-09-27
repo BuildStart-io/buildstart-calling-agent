@@ -29,7 +29,7 @@ func newAgentConfig(openRouterKey, model, systemPrompt, voice string, autoAnswer
 		systemPrompt = agent.DefaultSystemPrompt
 	}
 	if voice == "" {
-		voice = "gemini-aoede"
+		voice = "dialog-nipunika"
 	}
 	return &AgentConfig{
 		Enabled:           enabled,

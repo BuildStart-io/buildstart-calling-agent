@@ -20,39 +20,20 @@ func (m *CallManager) initCodec() {
 }
 
 func (m *CallManager) FeedCapturedPCM(data []float32) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	if m.codec == nil || m.rtpSession == nil || m.srtpSession == nil || !m.relay.HasConnection() {
+	if len(data) == 0 {
 		return
 	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.playQueue = append(m.playQueue, data...)
 	m.lastCaptureAt = time.Now()
-	frameSize := m.codec.FrameSize()
-	if m.encodeBuf == nil {
-		m.encodeBuf = make([]float32, frameSize)
-		m.encodeBufPos = 0
-	}
+}
 
-	offset := 0
-	for offset < len(data) {
-		toCopy := min(len(data)-offset, frameSize-m.encodeBufPos)
-		copy(m.encodeBuf[m.encodeBufPos:], data[offset:offset+toCopy])
-		m.encodeBufPos += toCopy
-		offset += toCopy
-		if m.encodeBufPos < frameSize {
-			break
-		}
-		frame := make([]float32, frameSize)
-		copy(frame, m.encodeBuf)
-		m.encodeBufPos = 0
-
-		opus, err := m.codec.Encode(frame)
-		if err != nil {
-			m.log.Debug("encode error", "err", err)
-			continue
-		}
-		m.sendOpusFrameLocked(opus)
-	}
+func (m *CallManager) FlushCapturedPCM() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.playQueue = nil
+	m.wasSilent = true
 }
 
 func (m *CallManager) sendOpusFrameLocked(opus []byte) {
@@ -87,27 +68,89 @@ func (m *CallManager) startSilenceKeepaliveLocked() {
 	stop := make(chan struct{})
 	m.keepaliveStop = stop
 	frameSize := m.codec.FrameSize()
+	silence := make([]float32, frameSize)
+	frame := make([]float32, frameSize)
+
 	go func() {
+		// Strict isochronous RTP ticker: 60ms frame size = 960 samples @ 16kHz
 		ticker := time.NewTicker(60 * time.Millisecond)
 		defer ticker.Stop()
-		silence := make([]float32, frameSize)
 		for {
 			select {
 			case <-stop:
 				return
 			case <-ticker.C:
 				m.mu.Lock()
-				ready := m.codec != nil && m.rtpSession != nil && m.srtpSession != nil && m.relay.HasConnection()
-				idle := time.Since(m.lastCaptureAt) > 120*time.Millisecond
-				if ready && idle {
-					if opus, err := m.codec.Encode(silence); err == nil {
-						m.sendOpusFrameLocked(opus)
-					}
-				}
+				m.dispatchAudioFrameLocked(frame, silence, frameSize)
 				m.mu.Unlock()
 			}
 		}
 	}()
+}
+
+func (m *CallManager) dispatchAudioFrameLocked(frame, silence []float32, frameSize int) {
+	if m.codec == nil || m.rtpSession == nil || m.srtpSession == nil || !m.relay.HasConnection() {
+		return
+	}
+
+	// Instant zero-latency pre-buffer (1 frame = 960 samples @ 16kHz = 60ms)
+	prebufferSamples := frameSize
+
+	if !m.wasPlaying {
+		if len(m.playQueue) >= prebufferSamples {
+			m.wasPlaying = true
+			copy(frame, m.playQueue[:frameSize])
+			m.playQueue = m.playQueue[frameSize:]
+			m.wasSilent = false
+			if opus, err := m.codec.Encode(frame); err == nil {
+				m.sendOpusFrameLocked(opus)
+			}
+		} else {
+			// In idle / pre-buffering state: send silence keepalive to maintain RTP heartbeat
+			m.wasSilent = true
+			if opus, err := m.codec.Encode(silence); err == nil {
+				m.sendOpusFrameLocked(opus)
+			}
+		}
+		return
+	}
+
+	// While actively playing:
+	if len(m.playQueue) >= frameSize {
+		copy(frame, m.playQueue[:frameSize])
+		m.playQueue = m.playQueue[frameSize:]
+		m.wasSilent = false
+		if opus, err := m.codec.Encode(frame); err == nil {
+			m.sendOpusFrameLocked(opus)
+		}
+	} else if time.Since(m.lastCaptureAt) > 400*time.Millisecond {
+		// Gemini turn has finished: flush trailing samples and return to idle
+		if len(m.playQueue) > 0 {
+			n := len(m.playQueue)
+			copy(frame, m.playQueue)
+			for i := n; i < frameSize; i++ {
+				frame[i] = 0
+			}
+			m.playQueue = nil
+			m.wasPlaying = false
+			m.wasSilent = true
+			if opus, err := m.codec.Encode(frame); err == nil {
+				m.sendOpusFrameLocked(opus)
+			}
+		} else {
+			m.wasPlaying = false
+			m.wasSilent = true
+			if opus, err := m.codec.Encode(silence); err == nil {
+				m.sendOpusFrameLocked(opus)
+			}
+		}
+	} else {
+		// Temporary jitter pause while Gemini is still streaming:
+		// PRESERVE playQueue so partial syllables are NEVER destroyed!
+		if opus, err := m.codec.Encode(silence); err == nil {
+			m.sendOpusFrameLocked(opus)
+		}
+	}
 }
 
 func (m *CallManager) onRelayData(data []byte) {

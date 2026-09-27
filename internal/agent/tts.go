@@ -44,7 +44,7 @@ type MultiTTS struct {
 
 func NewMultiTTS(voice string) *MultiTTS {
 	if voice == "" {
-		voice = "gemini-aoede" // Default to Google AI Studio Gemini Super-Natural Voice
+		voice = "dialog-nipunika" // Default to Dialog Axiata & University of Moratuwa Studio Voice
 	}
 	return &MultiTTS{
 		voice:      voice,
@@ -54,7 +54,7 @@ func NewMultiTTS(voice string) *MultiTTS {
 
 func (t *MultiTTS) GetVoice() string {
 	if t.voice == "" {
-		return "gemini-aoede"
+		return "dialog-nipunika"
 	}
 	return t.voice
 }

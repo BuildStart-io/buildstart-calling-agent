@@ -40,6 +40,11 @@ type CallManager struct {
 	encodeBuf    []float32
 	encodeBufPos int
 
+	playQueue   []float32
+	playTrigger chan struct{}
+	wasSilent   bool
+	wasPlaying  bool
+
 	lastCaptureAt  time.Time
 	keepaliveStop  chan struct{}
 	outPacketCount int
@@ -58,6 +63,8 @@ func NewCallManager(sock core.VoipSocket, log *slog.Logger) *CallManager {
 		sock:        sock,
 		log:         log,
 		debeEnabled: false,
+		playTrigger: make(chan struct{}, 1),
+		wasSilent:   true,
 	}
 	relay := transport.NewSctpRelayManager(log)
 	relay.SetOnConnected(func(ip string, port int) { m.onRelayConnected() })
@@ -93,7 +100,16 @@ func (m *CallManager) StartCall(ctx context.Context, callID string, peerJid type
 	if creator.IsEmpty() {
 		creator = m.sock.OwnPN()
 	}
-	resolved := m.sock.ResolveLIDForPN(ctx, peerJid)
+	targetPN := peerJid
+	if targetPN.Server == "lid" {
+		if pn := m.sock.ResolvePNForLID(ctx, targetPN); !pn.IsEmpty() {
+			targetPN = pn
+		}
+	}
+	resolved := m.sock.ResolveLIDForPN(ctx, targetPN)
+	if resolved.IsEmpty() {
+		resolved = targetPN
+	}
 
 	call := NewOutgoingCall(callID, resolved.String(), creator.String(), mediaType)
 	callKey := media.GenerateCallKey()

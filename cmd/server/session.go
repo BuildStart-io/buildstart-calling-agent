@@ -20,7 +20,6 @@ import (
 	"go.mau.fi/whatsmeow"
 	waBinary "go.mau.fi/whatsmeow/binary"
 	"go.mau.fi/whatsmeow/proto/waE2E"
-	"go.mau.fi/whatsmeow/proto/waWeb"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 )
@@ -58,36 +57,41 @@ func newSession(mgr *SessionManager, id, name string, client *whatsmeow.Client) 
 
 func (s *Session) createCall(callID string) *call.CallManager {
 	cm := call.NewCallManager(wa.NewSocket(s.client), s.log.With("call_id", callID))
-	ac := &activeCall{cm: cm}
+	ac := &activeCall{
+		cm: cm,
+	}
 
-	if cfg := s.mgr.agentConfig; cfg != nil {
-		ag := agent.NewAIAgent(cfg.RawKey(), cfg.CurrentModel(), cfg.CurrentPrompt(), s.log.With("call_id", callID))
-		if azKey, azReg := cfg.AzureConfig(); azKey != "" {
-			ag.SetAzureTTS(azKey, azReg)
+	if cfg := s.mgr.agentConfig; cfg != nil && cfg.IsEnabled() {
+		rawKey := cfg.RawKey()
+		if rawKey != "" {
+			voice := cfg.CurrentVoice()
+			if voice == "" || strings.HasPrefix(voice, "dialog-") || strings.HasPrefix(voice, "piper-") || voice == "Kore" {
+				voice = "Aoede"
+			}
+			model := cfg.CurrentModel()
+			if model == "" {
+				model = "models/gemini-3.1-flash-live-preview"
+			}
+			if strings.HasPrefix(model, "google/") {
+				model = strings.TrimPrefix(model, "google/")
+			}
+			if !strings.HasPrefix(model, "models/") {
+				model = "models/" + model
+			}
+			prompt := cfg.CurrentPrompt()
+
+			gl := agent.NewGeminiLiveAgent(rawKey, model, voice, prompt, s.log.With("call_id", callID))
+			gl.FeedAudio = func(pcm []float32) {
+				ac.PushAudio(pcm)
+			}
+			gl.OnInterrupt = func() {
+				ac.cm.FlushCapturedPCM()
+			}
+			gl.OnTranscript = func(msg agent.TranscriptMessage) {
+				s.mgr.broker.emitAgentTranscript(s.id, callID, msg.Role, msg.Text, msg.Timestamp)
+			}
+			ac.geminiLive = gl
 		}
-		if gKey := cfg.GoogleConfig(); gKey != "" {
-			ag.SetGoogleCloudTTS(gKey)
-		}
-		if hfTok := cfg.HuggingFaceToken(); hfTok != "" {
-			ag.SetHuggingFaceTTS(hfTok)
-		}
-		if cURL, cKey := cfg.CustomTts(); cURL != "" {
-			ag.SetOpenAITTS(cURL, cKey)
-		}
-		if voice := cfg.CurrentVoice(); voice != "" {
-			ag.SetVoice(voice)
-		}
-		ag.SetEnabled(cfg.IsEnabled())
-		ag.FeedAudio = func(pcm []float32) {
-			cm.FeedCapturedPCM(pcm)
-		}
-		ag.OnTranscript = func(msg agent.TranscriptMessage) {
-			s.mgr.broker.emitAgentTranscript(s.id, callID, msg.Role, msg.Text, msg.Timestamp)
-		}
-		ag.OnStateChange = func(state agent.AgentState) {
-			s.mgr.broker.emitAgentStatus(s.id, callID, ag.IsEnabled(), string(state))
-		}
-		ac.agent = ag
 	}
 
 	s.wireCall(cm, callID)
@@ -112,8 +116,13 @@ func (s *Session) wireCall(cm *call.CallManager, callID string) {
 	}
 	cm.OnStateChange = func(c *call.CallInfo) {
 		if c.IsEnded() {
-			if ac, ok := s.reg.get(c.CallID); ok && ac.agent != nil {
-				ac.agent.Close()
+			if ac, ok := s.reg.get(c.CallID); ok {
+				if ac.geminiLive != nil {
+					ac.geminiLive.Close()
+				}
+				if ac.agent != nil {
+					ac.agent.Close()
+				}
 			}
 			s.removeCall(c.CallID)
 			s.mgr.broker.endCall(c.CallID, string(c.StateData.EndReason))
@@ -145,9 +154,13 @@ func (s *Session) wireCall(cm *call.CallManager, callID string) {
 			now := time.Now().UnixMilli()
 			rec.ConnectedAt = &now
 			rec.Status = StatusConnected
-			s.mgr.broker.recordCallEvent(c.CallID, "connected", "Call connected (WebRTC relay established, audio streaming active)", "")
-			if ac, ok := s.reg.get(c.CallID); ok && ac.agent != nil && ac.agent.IsEnabled() {
-				ac.agent.GreetCaller()
+			s.mgr.broker.recordCallEvent(c.CallID, "connected", "Call connected (Gemini Multimodal Live active)", "")
+			if ac, ok := s.reg.get(c.CallID); ok {
+				if ac.geminiLive != nil {
+					ac.geminiLive.TriggerGreeting()
+				} else if ac.agent != nil && ac.agent.IsEnabled() {
+					ac.agent.GreetCaller()
+				}
 			}
 		}
 		s.mgr.broker.upsertCall(rec)
@@ -159,6 +172,9 @@ func (s *Session) wireCall(cm *call.CallManager, callID string) {
 		if ac, ok := s.reg.get(c.CallID); ok {
 			callbackJID = ac.callbackJID
 			peerAudioReceived = ac.peerAudioReceived
+			if ac.geminiLive != nil {
+				ac.geminiLive.Close()
+			}
 			if ac.agent != nil {
 				hadConversation = ac.agent.HasSpokenWithPeer()
 				ac.agent.Close()
@@ -177,6 +193,13 @@ func (s *Session) wireCall(cm *call.CallManager, callID string) {
 		isTrulyAnswered := c.StateData.ConnectedAt != nil && (peerAudioReceived || hadConversation)
 		if isTrulyAnswered {
 			s.mgr.broker.setCallOutcome(c.CallID, "Completed (AI Voice Handled)", "Call answered and completed with AI assistant.")
+			if rec, _ := s.mgr.broker.getCall(c.CallID); rec != nil && len(rec.Transcripts) >= 2 {
+				leadPeer := callbackJID
+				if leadPeer.IsEmpty() {
+					leadPeer, _ = types.ParseJID(c.PeerJid)
+				}
+				s.GenerateAndSendLeadDossier(c.CallID, leadPeer, rec.Transcripts)
+			}
 		} else if c.Direction == core.CallDirectionIncoming {
 			s.mgr.broker.setCallOutcome(c.CallID, "Missed / Unanswered", "Caller hung up before audio connection established.")
 			peer := callbackJID
@@ -218,6 +241,10 @@ func (s *Session) wireCall(cm *call.CallManager, callID string) {
 			return
 		}
 		ac.peerAudioReceived = true
+		ac.broadcastAudio(pcm16)
+		if ac.geminiLive != nil && ac.geminiLive.IsEnabled() {
+			ac.geminiLive.FeedCallerAudio(pcm16)
+		}
 		if ac.bridge != nil {
 			_ = ac.bridge.WritePCM(pcm16)
 		}
@@ -230,11 +257,20 @@ func (s *Session) wireCall(cm *call.CallManager, callID string) {
 func (s *Session) startOutgoingWithGreeting(ctx context.Context, peer types.JID, isVideo bool, customGreeting string) (string, error) {
 	callID := signaling.GenerateCallID()
 	cm := s.createCall(callID)
-	if ac, ok := s.reg.get(callID); ok && ac.agent != nil {
-		if customGreeting != "" {
-			ac.agent.SetCustomGreeting(customGreeting)
+	if ac, ok := s.reg.get(callID); ok {
+		if ac.geminiLive != nil && ac.geminiLive.IsEnabled() {
+			go func() {
+				if err := ac.geminiLive.Start(); err != nil {
+					s.log.Error("failed to pre-warm Gemini Live for outbound call", "err", err)
+				}
+			}()
 		}
-		ac.agent.PrewarmGreeting()
+		if ac.agent != nil {
+			if customGreeting != "" {
+				ac.agent.SetCustomGreeting(customGreeting)
+			}
+			ac.agent.PrewarmGreeting()
+		}
 	}
 	dir := "outbound"
 	trigger := "manual"
@@ -244,12 +280,10 @@ func (s *Session) startOutgoingWithGreeting(ctx context.Context, peer types.JID,
 		trigger = "autonomous_callback"
 		outcome = "Auto-Callback In Progress"
 	}
-	if peer.Server == "lid" || peer.Server == "" {
-		if pn := s.mgr.store.getPNForLID(ctx, peer.User); pn != "" {
-			peer = types.NewJID(pn, types.DefaultUserServer)
-		} else if peer.User == "17609835688032" {
-			peer = types.NewJID("94765225044", types.DefaultUserServer)
-		}
+	if pn := s.mgr.store.getPNForLID(ctx, peer.User); pn != "" {
+		peer = types.NewJID(pn, types.DefaultUserServer)
+	} else if peer.User == "17609835688032" {
+		peer = types.NewJID("94765225044", types.DefaultUserServer)
 	}
 	peerNum := s.mgr.store.resolvePhone(peer.User)
 	now := time.Now().UnixMilli()
@@ -349,16 +383,24 @@ func (s *Session) onIncomingOffer(ctx context.Context, evt *events.CallOffer) {
 	cm.HandleCallOffer(ctx, node, evt.From)
 
 	if s.mgr.agentConfig != nil && s.mgr.agentConfig.IsAutoAnswer() {
-		s.log.Info("auto-answering incoming WhatsApp call after 1.2s ring with AI Agent", "call_id", callID)
+		s.log.Info("auto-answering incoming WhatsApp call after 1.2s ring", "call_id", callID)
 		go func() {
-			// Pre-synthesize the greeting during the ring delay so it plays instantly on connect
-			if ac, ok := s.reg.get(callID); ok && ac.agent != nil {
-				s.mgr.broker.recordCallEvent(callID, "agent_prewarm", "AI Voice Agent pre-synthesizing greeting audio", "")
-				ac.agent.PrewarmGreeting()
+			if ac, ok := s.reg.get(callID); ok {
+				if ac.geminiLive != nil && ac.geminiLive.IsEnabled() {
+					s.mgr.broker.recordCallEvent(callID, "gemini_prewarm", "AI Voice Agent pre-warming Gemini Live WebSocket during ring", "")
+					go func() {
+						if err := ac.geminiLive.Start(); err != nil {
+							s.log.Error("failed to pre-warm Gemini Live during ring", "err", err)
+						}
+					}()
+				} else if ac.agent != nil && ac.agent.IsEnabled() {
+					s.mgr.broker.recordCallEvent(callID, "agent_prewarm", "AI Voice Agent pre-synthesizing greeting audio", "")
+					ac.agent.PrewarmGreeting()
+				}
 			}
 			time.Sleep(1200 * time.Millisecond)
-			s.mgr.broker.recordCallEvent(callID, "accepting", "Accepting incoming call with AI Agent", "")
-			s.mgr.broker.emitIncomingClaimed(s.id, callID, "ai-agent")
+			s.mgr.broker.recordCallEvent(callID, "accepting", "Accepting incoming call", "")
+			s.mgr.broker.emitIncomingClaimed(s.id, callID, "auto-answer")
 			if err := cm.AcceptCall(context.Background(), callID); err != nil {
 				s.log.Error("failed to auto-answer incoming call", "call_id", callID, "err", err)
 				s.mgr.broker.recordCallEvent(callID, "accept_error", "Failed to answer call: "+err.Error(), "")
@@ -429,30 +471,11 @@ func (s *Session) handleEvent(rawEvt any) {
 }
 
 func (s *Session) handleIncomingMessage(evt *events.Message) {
-	// 1. Check for Missed Call stub message from WhatsApp WebMessageInfo
-	if evt.SourceWebMsg != nil {
-		stub := evt.SourceWebMsg.GetMessageStubType()
-		if stub == waWeb.WebMessageInfo_CALL_MISSED_VOICE ||
-			stub == waWeb.WebMessageInfo_CALL_MISSED_VIDEO ||
-			stub == waWeb.WebMessageInfo_CALL_MISSED_GROUP_VOICE ||
-			stub == waWeb.WebMessageInfo_CALL_MISSED_GROUP_VIDEO {
-			s.log.Info("missed call message detected from WhatsApp", "sender", evt.Info.Sender, "stub", stub)
-			s.scheduleAutoCallback(evt.Info.Sender, "missed_call_stub")
-			return
-		}
+	if evt.Info.IsFromMe {
+		return
 	}
 
-	// 2. Check for E2E CallLogMessage if present
-	if evt.Message != nil && evt.Message.GetCallLogMesssage() != nil {
-		cl := evt.Message.GetCallLogMesssage()
-		if cl.GetCallOutcome() == waE2E.CallLogMessage_MISSED {
-			s.log.Info("call log message missed detected", "sender", evt.Info.Sender)
-			s.scheduleAutoCallback(evt.Info.Sender, "call_log_missed")
-			return
-		}
-	}
-
-	// 3. Check for text triggers like "call", "call me", "call back", "කතා කරන්න"
+	// Check for text triggers like "call", "call me", "call back", "කතා කරන්න"
 	if evt.Message != nil {
 		text := strings.TrimSpace(strings.ToLower(evt.Message.GetConversation()))
 		if text == "" && evt.Message.GetExtendedTextMessage() != nil {
@@ -486,7 +509,7 @@ func (s *Session) scheduleAutoCallback(peer types.JID, reason string) {
 		s.lastCallbacks = make(map[string]time.Time)
 	}
 	last, exists := s.lastCallbacks[peerStr]
-	if exists && time.Since(last) < 15*time.Second {
+	if exists && time.Since(last) < 2*time.Minute {
 		s.lastCallbackMu.Unlock()
 		s.log.Debug("auto-callback debounced (called recently)", "peer", peerStr, "reason", reason)
 		return
@@ -496,8 +519,8 @@ func (s *Session) scheduleAutoCallback(peer types.JID, reason string) {
 
 	s.log.Info("scheduling instant AI auto-callback", "peer", peerStr, "reason", reason)
 	go func() {
-		// Wait 2.0s so the caller's phone returns to idle state from the previous attempt
-		time.Sleep(2000 * time.Millisecond)
+		// Wait 4.0s so the caller's phone returns to idle state from the previous attempt
+		time.Sleep(4000 * time.Millisecond)
 
 		// Check if we already have an active call with this peer
 		for _, ac := range s.reg.all() {

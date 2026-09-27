@@ -1,3 +1,4 @@
+
 package agent
 
 import (
@@ -23,8 +24,8 @@ func DefaultVADConfig() VADConfig {
 		SampleRate:        16000,
 		EnergyThreshold:   0.016, // sensitive to normal mobile phone speaking volume
 		MinSpeechFrames:   2,     // 120ms to detect speech onset
-		SilenceDuration:   850 * time.Millisecond,
-		MaxSpeechDuration: 14 * time.Second,
+		SilenceDuration:   750 * time.Millisecond,
+		MaxSpeechDuration: 15 * time.Second,
 		MinSpeechSamples:  6400, // 400ms minimum speech buffer
 	}
 }

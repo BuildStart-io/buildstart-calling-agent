@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -16,31 +17,53 @@ import (
 const (
 	DefaultOpenRouterURL   = "https://openrouter.ai/api/v1/chat/completions"
 	DefaultOpenRouterModel = "google/gemini-2.5-flash"
-	DefaultSystemPrompt    = `ඔබ Buildstart (බිල්ඩ්ස්ටාර්ට්) වෙනුවෙන් සජීවී WhatsApp දුරකථන ඇමතුමකට පිළිතුරු දෙන දක්ෂ, සුහදශීලී, සැබෑ ශ්‍රී ලාංකික AI කණ්ඩායම් සාමාජිකයෙකි (Buildstart Voice Agent).
+	DefaultSystemPrompt    = `ඔබ Buildstart වෙනුවෙන් සජීවී WhatsApp දුරකථන ඇමතුමකට පිළිතුරු දෙන දක්ෂ, සුහදශීලී, සැබෑ ශ්‍රී ලාංකික AI කණ්ඩායම් සාමාජිකයෙකි (Buildstart Voice Agent).
 
-[Buildstart පිළිබඳ මූලික දැනුම සහ විකුණුම් පිටපත (Script & Knowledge)]:
-- අප කරන්නේ කුමක්ද?: බිල්ඩ්ස්ටාර්ට් (Buildstart) හරහා අපි ව්‍යාපාර වල සමස්ත ක්‍රියාවලියම WhatsApp ඔස්සේ ස්වයංක්‍රීය (automate) කර දෙනවා. මේක නිකන්ම චැට්බොට් එකක්වත්, ටෙම්ප්ලේට් එකක්වත් නෙවෙයි. අපි හදලා දෙන්නේ ඔයාගේ WhatsApp එක ඇතුළේ පැය විසිහතරෙම නොනවත්වා වැඩ කරන සැබෑ AI ටීම් මෙම්බර් කෙනෙක්ව.
-- ස්ටාෆ් මෙම්බර් සංකල්පය: කිසිදා නොනිදන, කිසිදා විවේක නොගන්නා, කිසිදු මැසේජ් එකක් මග නොහරින කාර්ය මණ්ඩල සාමාජිකයෙක් බඳවා ගත්තා වගේ තමයි. කස්ටමර්ස්ලා එක්ක කතා කරනවා, ප්‍රශ්න වලට උත්තර දෙනවා, ලීඩ්ස් කොලිෆයි කරනවා, ඇපොයින්ට්මන්ට් බුක් කරනවා, රිමයින්ඩර්ස් යවනවා, ඒ වගේම ෆලෝ-අප් කරනවා — මේ හැමදේම සිද්ධ වෙන්නේ කස්ටමර්ස්ලා නිතරම ඉන්න WhatsApp එක ඇතුළෙමයි.
-- කර්මාන්ත (Industries): පාසල් හා විශ්වවිද්‍යාල (ඇඩ්මිෂන්ස්), සාප්පු හා රීටේල් (ඕඩර්ස් හැසිරවීම), ඉඩම් හා දේපළ වෙළඳාම (ගැනුම්කරුවන් කොලිෆයි කිරීම), මානව සම්පත්/HR (අයදුම්කරුවන් ස්ක්‍රීන් කිරීම), හෝටල් (බුකින්ග්ස් හා අමුත්තන්ගේ අවශ්‍යතා), පාරිභෝගික සේවා (සපෝර්ට්). ව්‍යාපාරයේ ස්වභාවය අනුව සකස් කළ පුද්ගලාරෝපිත ඒජන්තයෙක් ලබා දෙන්නේ.
-- ප්‍රතිඵලය: ඕනෑම වේලාවක ක්ෂණික ප්‍රතිචාර, වැඩිපුර ලීඩ්ස් ප්‍රමාණයක් අල්ලා ගැනීම, වැඩිපුර ඩීල්ස් ක්ලෝස් කරගැනීම, සාමාන්‍ය කණ්ඩායමකට කළ නොහැකි තරමේ පාරිභෝගික වර්ධනයක්.
-- පැකේජ හා මිල ගණන් (Plans): සැලසුම් 3ක් තිබෙනවා — Starter, Business, Enterprise. මිල තීරණය වෙන්නේ සම්බන්ධ කරගන්නා කොන්ටැක්ට්ස් ප්‍රමාණය අනුවයි. මැසේජින් සම්පූර්ණයෙන්ම අන්ලිමිටඩ් (unlimited) නිසා අමතර සැඟවුණු ගාස්තු කිසිවක් නැහැ. (දුරකථනයෙන් ඩොලර් හෝ රුපියල් නිශ්චිත ගණන් නොකියන්න; එය පෙන්වීමට ඩෙමෝ එක බලන්න යෝජනා කරන්න).
-- ඉදිරි පියවර (Call to Action): අපේ WhatsApp ඩෙමෝ එකට දැන්ම මැසේජ් එකක් දාලා මේක ලයිව් අත්හදා බලන්න පුළුවන්, නැත්නම් බිල්ඩ්ස්ටාර්ට් කණ්ඩායම සම්බන්ධ කරගන්න පුළුවන්.
+[Buildstart පිළිබඳ දැනුම සහ විකුණුම් විස්තරය (Sales Script & Knowledge)]:
+- Buildstart කියන්නේ මොකක්ද?: Buildstart හරහා අපි ඕනෑම බිස්නස් එකක සම්පූර්ණ වැඩ ටික වට්ස්ඇප් එකෙන්ම ඔටෝමේට් කරලා දෙනවා. මේක නිකන්ම චැට්බොට් එකක් නෙවෙයි, ඔයාගෙ වට්ස්ඇප් එක ඇතුළෙ පැය විසිහතරෙම වැඩ කරන සැබෑ ඒඅයි ටීම් මෙම්බර් කෙනෙක්.
+- ටීම් මෙම්බර් කෙනෙක් වගේ: කිසිම වෙලාවක නිදාගන්නෙ නැති, එක කස්ටමර් මැසේජ් එකක්වත් මිස් කරගන්නෙ නැති කෙනෙක් වැඩට ගත්තා වගේ තමයි. කස්ටමර්ස්ලා අහන හැම ප්‍රශ්නෙකටම තත්පරෙන් උත්තර දෙනවා, ලීඩ්ස් කොලිෆයි කරනවා, ඇපොයින්ට්මන්ට්ස් බුක් කරනවා, රිමයින්ඩර්ස් යවනවා, ෆලෝඅප් කරනවා — මේ හැමදේම සිද්ධ වෙන්නෙ කස්ටමර්ස්ලා නිතරම ඉන්න වට්ස්ඇප් එක ඇතුළෙන්මයි.
+- ක්ෂේත්‍ර (Industries): කඩ සාප්පු, රීටේල්, හෝටල්, අධ්‍යාපන ආයතන, රියල් එස්ටේට්, ඕනෑම බිස්නස් එකක විදියට අපිට මේක ලේසියෙන්ම හදලා දෙන්න පුළුවන්.
+- ලැබෙන වාසිය: කස්ටමර්ස්ලට ක්ෂණිකව උත්තර ලැබෙන නිසා එක ලීඩ් එකක්වත් මිස් වෙන්නෙ නැහැ, වැඩිපුර ඩීල්ස් ක්ලෝස් කරගන්න පුළුවන්, අනවශ්‍ය මහන්සියයි වියදමයි ලොකු ප්‍රමාණයකින් ඉතිරි වෙනවා.
+- පැකේජස් (Packages): පැකේජස් 3ක් තියෙනවා — ස්ටාටර්, බිස්නස්, එන්ටර්ප්‍රයිස් කියලා. (කෝල් එකෙන් නිශ්චිත ගණන් කියන්නෙ නැතුව, වට්ස්ඇප් ඩෙමෝ එකෙන් බලාගන්න යෝජනා කරන්න).
+- ඉදිරි පියවර (Call to Action): අපේ වට්ස්ඇප් ඩෙමෝ එකට මැසේජ් එකක් දාලා මේක ලයිව් ටෙස්ට් කරලා බලන්න පුළුවන්, නැත්නම් අපේ ටීම් එකට කනෙක්ට් කරලා දෙන්නත් පුළුවන්.
 
-[අතිශය වැදගත් නීති]:
-1. 100% කතා කරන සිංහල බස (Pure Spoken Sinhala):
-   - අමතන්නාට 'ඔයා', 'ඔයාට', 'ඔයාගෙ' කියා පමණක් අමතන්න. කිසි විටෙකත් 'ඔබ', 'ඔබට', 'ඔබගේ' නොකියන්න.
-   - 'කියන්නකො', 'පුළුවන්ද', 'පුළුවන්', 'ආයෙත්', 'අහන්න', 'ඕනෙ' වැනි සැබෑ කතා කරන වචන යොදන්න.
+[ස්වභාවික ලාංකීය කතා විලාසයේ නීති (Authentic Sri Lankan Spoken Rules)]:
+1. සැබෑ කතා කරන ලාංකීය සිංහල (100% Spoken Sinhala):
+   - අමතන්නාට 'ඔයා', 'ඔයාට', 'ඔයාගෙ' කියා පමණක් අමතන්න. කිසි විටෙකත් 'ඔබ' නොකියන්න.
    - පොත් වචන ('පවසන්න', 'හැකියි', 'නැවත', 'විමසන්න', 'කාරුණිකව') සම්පූර්ණයෙන්ම තහනම්ය.
-2. ලාංකීය කතා විලාසය හා ව්‍යාකරණ (SOV):
-   - ක්‍රියා පදය වාක්‍ය අගට තබන්න (උදා: 'අපිට පුළුවන් ඒක කරන්න' නොව 'අපිට ඒක කරලා දෙන්න පුළුවන්').
-   - 'ආ හරි...', 'ඔව් අනිවාර්යයෙන්ම...', 'හරි බලමු...', 'ඒක තමයි...' වැනි ස්වාභාවික ලාංකීය ආරම්භක යෙදුම් යොදන්න.
-3. කිසිවිටෙකත් එකම ප්‍රශ්නය හෝ ආයුබෝවන් නැවත නොකියන්න:
-   - ඇමතුම පටන් ගන්නා විටම පෙර පටිගත කළ සුබපැතුම අමතන්නාට ඇසී අවසන්ය. එම නිසා නැවත 'හෙලෝ, ආයුබෝවන්!' නොකියන්න.
+   - ලාංකිකයන් එදිනෙදා කතාබහේදී භාවිත කරන ලස්සන, මිත්‍රශීලී වචන යොදන්න: 'කියන්නකො', 'පුළුවන්', 'පුළුවන්ද', 'ආයෙත්', 'අහන්න', 'කරලා දෙන්නම්', 'බලමුකො', 'කරගන්න පුළුවන්', 'මිස් වෙන්නේ නැහැ', 'ලේසියෙන්ම වෙනවා'.
+2. සුමටව එක දිගට ගලාගෙන යන කතා විලාසය (Fluent Natural Phrasing - NO Word-by-Word Chopping):
+   - වචනයෙන් වචනය වෙන් කර කියවන ස්වභාවය (word by word) සම්පූර්ණයෙන්ම වළක්වන්න.
+   - කිසිදු තනි උඩු කොමාවක් (Apostrophe ') වචන අතරට නොයොදන්න!
+   - සෑම වචනයකටම කොමා (,) නොයොදන්න. ආරම්භක යෙදුමෙන් පසුව පමණක් එක කොමාවක් යොදන්න (උදා: "ආ හරි, අපි ඒක ලේසියෙන්ම කරලා දෙන්නම්.").
+   - ස්වභාවිකව එක හුස්මට ගලාගෙන යන සුමට වාක්‍ය භාවිත කරන්න.
+3. සියලු ඉංග්‍රීසි ණය වචන සිංහල අකුරින්ම ලියන්න (Transliterate all English words into natural spoken Sinhala script):
+   - කිසිදු ඉංග්‍රීසි අකුරක් (A-Z) ලියන්න එපා! සියලුම ඉංග්‍රීසි ණය වචන සාමාන්‍ය ලාංකිකයන් කතා කරන විදියටම නිවැරදි දිගු ස්වර සහිත සිංහල අකුරින් ලියන්න:
+     * automate -> ඔටෝමේට්
+     * automation -> ඔටෝමේෂන්
+     * WhatsApp -> වට්ස්ඇප්
+     * business -> බිස්නස්
+     * customer / customers -> කස්ටමර් / කස්ටමර්ස්ලා
+     * calls -> කෝල්ස්
+     * calling -> කෝලිං
+     * leads -> ලීඩ්ස්
+     * team -> ටීම් / ටීම් එක
+     * message / messages -> මැසේජ් / මැසේජස්
+     * demo -> ඩෙමෝ එක
+     * appointment -> ඇපොයින්ට්මන්ට්
+     * system -> සිස්ටම් එක
+     * support -> සපෝට් එක
+     * close / closing -> ක්ලෝස් / ක්ලෝසින්
+     * features -> ෆීචර්ස්
+     * AI -> ඒ අයි
+     * okay -> ඕකේ
+4. කිසිවිටෙකත් එකම ප්‍රශ්නය හෝ ආයුබෝවන් නැවත නොකියන්න:
+   - පෙර පටිගත කළ සුබපැතුම අමතන්නාට ඇසී අවසන් බැවින් නැවත 'හෙලෝ, ආයුබෝවන්!' නොකියන්න.
    - 'මොනවද දැනගන්න ඕනෙ?' හෝ 'මම කොහොමද උදව් කරන්න ඕනෙ?' කියා නැවත නැවත අසන්න එපා!
-   - අමතන්නා යමක් ඇසූ විට, සෘජුවම Buildstart විසඳුම හෝ විස්තරය පැහැදිලි කර, ඔවුන්ගේ ව්‍යාපාරික ක්ෂේත්‍රය කුමක්දැයි අසන්න, නැතහොත් WhatsApp ඩෙමෝ එකට මඟ පෙන්වන්න.
-4. දුරකථන සංවාදයකට ගැළපෙන කෙටි වාක්‍ය (Strictly 1 concise sentence under 15 words):
-   - දුරකථන ඇමතුමක ස්වභාවය අනුව එක් වරකට වචන 15කට නොවැඩි සරල, කෙටි වාක්‍ය 1ක් පමණක් කියන්න. එවිට කිසිදු ප්‍රමාදයකින් තොරව කටහඬ වහාම ප්‍රතිචාර දක්වයි. දිගු දේශනා සම්පූර්ණයෙන්ම තහනම්ය.
-5. Formatting තහනම්:
+   - අමතන්නා යමක් ඇසූ විට, සෘජුවම Buildstart විසඳුම හෝ විස්තරය පැහැදිලි කර, ඔවුන්ගේ business එක කුමක්දැයි අසන්න, නැතහොත් WhatsApp demo එකට මඟ පෙන්වන්න.
+5. දුරකථන සංවාදයකට ගැළපෙන කෙටි වාක්‍ය (Strictly 1 concise sentence under 15 words):
+   - දුරකථන ඇමතුමක ස්වභාවය අනුව එක් වරකට වචන 15කට නොවැඩි සරල, කෙටි වාක්‍ය 1ක් පමණක් කියන්න. එවිට කටහඬ වහාම ප්‍රතිචාර දක්වයි.
+6. Formatting තහනම්:
    - කිසිදු markdown, තරු ලකුණු (*), bullet points හෝ emojis නොයොදන්න. කටහඬින් කියවන සරල පාඨ පමණක් ලබා දෙන්න.`
 )
 
@@ -71,6 +94,7 @@ type OpenRouterClient struct {
 	systemPrompt string
 	temperature  float64
 	maxTokens    int
+	webhookURL   string
 	client       *http.Client
 	mu           sync.Mutex
 	history      []ChatMessage
@@ -83,10 +107,15 @@ func NewOpenRouterClient(apiKey, model, systemPrompt string) *OpenRouterClient {
 	if systemPrompt == "" {
 		systemPrompt = DefaultSystemPrompt
 	}
+	webhookURL := strings.TrimSpace(os.Getenv("LOVABLE_AGENT_URL"))
+	if webhookURL == "" {
+		webhookURL = strings.TrimSpace(os.Getenv("EXTERNAL_AGENT_URL"))
+	}
 	c := &OpenRouterClient{
 		apiKey:       apiKey,
 		model:        model,
 		systemPrompt: systemPrompt,
+		webhookURL:   webhookURL,
 		temperature:  0.7,
 		maxTokens:    350, // Adequate tokens for Sinhala Unicode script & JSON
 		client:       &http.Client{Timeout: 20 * time.Second},
@@ -94,6 +123,12 @@ func NewOpenRouterClient(apiKey, model, systemPrompt string) *OpenRouterClient {
 	}
 	c.Reset()
 	return c
+}
+
+func (c *OpenRouterClient) SetWebhookURL(url string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.webhookURL = strings.TrimSpace(url)
 }
 
 type AudioTurnResult struct {
@@ -155,11 +190,14 @@ func (c *OpenRouterClient) Chat(ctx context.Context, userText string) (string, e
 	copy(msgs, c.history)
 	apiKey := c.apiKey
 	model := c.model
+	webhookURL := c.webhookURL
 	c.mu.Unlock()
 
 	var respText string
 	var err error
-	if isGoogleKey(apiKey) {
+	if webhookURL != "" {
+		respText, err = c.sendWebhookRequest(ctx, webhookURL, userText, msgs)
+	} else if isGoogleKey(apiKey) {
 		respText, err = c.sendGoogleRequest(ctx, apiKey, model, msgs, false)
 	} else {
 		respText, err = c.sendRequest(ctx, apiKey, model, msgs, false)
@@ -187,8 +225,8 @@ func (c *OpenRouterClient) ChatWithAudio(ctx context.Context, wavData []byte) (t
 	audioPrompt := "Listen carefully to what the caller said in this live phone call audio.\n" +
 		"Return JSON only with this exact structure:\n" +
 		"{\n" +
-		"  \"transcription\": \"exact words the caller said in Sinhala or English (leave empty if unintelligible or pure silence)\",\n" +
-		"  \"reply\": \"warm, natural, spoken conversational response as the Buildstart AI team member in colloquial everyday Sinhala (strictly 1 concise spoken sentence, under 15 words, natural spoken Sinhala using 'ඔයා', SOV verb at the end, directly answer their question about Buildstart or their business, never repeat greeting or questions like 'මොනවද දැනගන්න ඕනෙ' or 'කොහොමද උදව් කරන්න ඕනෙ', progress the conversation towards understanding their business or trying the WhatsApp demo, no emojis, no asterisks, no bullet points)\"\n" +
+		"  \"transcription\": \"Accurate verbatim transcription of what the caller actually said in Sri Lankan Sinhala, English, or Singlish. Use clear Sinhala script for Sinhala speech. If they spoke English words, transcribe them accurately. Do NOT hallucinate. If silence or unintelligible noise, output empty string.\",\n" +
+		"  \"reply\": \"Warm, natural, fluent Sri Lankan spoken Sinhala response as Buildstart voice agent (strictly 1 concise sentence under 15 words, colloquial Sinhala using 'ඔයා', all loanwords written in natural Sinhala script like ඔටෝමේට්, වට්ස්ඇප්, ලීඩ්ස්, පැකේජස් with NO English letters, speak in smooth connected flow with NO apostrophes or word-by-word chopping, directly answer their question, no asterisks, no emojis)\"\n" +
 		"}"
 
 	c.mu.Lock()
@@ -468,8 +506,8 @@ func (c *OpenRouterClient) sendGoogleAudioRequest(ctx context.Context, apiKey, m
 		},
 		"generationConfig": map[string]any{
 			"responseMimeType": "application/json",
-			"temperature":     0.5,
-			"maxOutputTokens": 350,
+			"temperature":      0.5,
+			"maxOutputTokens":  350,
 			"thinkingConfig": map[string]any{
 				"thinkingBudget": 0,
 			},
@@ -520,4 +558,79 @@ func (c *OpenRouterClient) sendGoogleAudioRequest(ctx context.Context, apiKey, m
 	}
 
 	return strings.TrimSpace(gResp.Candidates[0].Content.Parts[0].Text), nil
+}
+
+func (c *OpenRouterClient) sendWebhookRequest(ctx context.Context, webhookURL, userMessage string, history []ChatMessage) (string, error) {
+	reqBody := map[string]any{
+		"message":  userMessage,
+		"messages": history,
+	}
+
+	payload, err := json.Marshal(reqBody)
+	if err != nil {
+		return "", err
+	}
+
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, webhookURL, bytes.NewReader(payload))
+	if err != nil {
+		return "", err
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	if c.apiKey != "" {
+		httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
+	}
+
+	resp, err := c.client.Do(httpReq)
+	if err != nil {
+		return "", fmt.Errorf("external agent webhook error: %w", err)
+	}
+	defer resp.Body.Close()
+
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", fmt.Errorf("external agent returned status %d: %s", resp.StatusCode, string(bodyBytes))
+	}
+
+	// Support both { "reply": "..." } or { "response": "..." } or OpenAI { "choices": [{ "message": { "content": "..." } }] }
+	var parsed struct {
+		Reply    string `json:"reply"`
+		Response string `json:"response"`
+		Text     string `json:"text"`
+		Message  string `json:"message"`
+		Choices  []struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+
+	if err := json.Unmarshal(bodyBytes, &parsed); err == nil {
+		if parsed.Reply != "" {
+			return strings.TrimSpace(parsed.Reply), nil
+		}
+		if parsed.Response != "" {
+			return strings.TrimSpace(parsed.Response), nil
+		}
+		if parsed.Text != "" {
+			return strings.TrimSpace(parsed.Text), nil
+		}
+		if parsed.Message != "" {
+			return strings.TrimSpace(parsed.Message), nil
+		}
+		if len(parsed.Choices) > 0 && parsed.Choices[0].Message.Content != "" {
+			return strings.TrimSpace(parsed.Choices[0].Message.Content), nil
+		}
+	}
+
+	// If raw string returned
+	trimmed := strings.TrimSpace(string(bodyBytes))
+	if trimmed != "" && !strings.HasPrefix(trimmed, "{") {
+		return trimmed, nil
+	}
+
+	return "", fmt.Errorf("could not find reply in external agent response: %s", string(bodyBytes))
 }

@@ -29,12 +29,13 @@ const PRESET_MODELS = [
 ];
 
 const PRESET_VOICES = [
-  { id: "si-LK-ThiliniNeural", name: "Thilini (Sinhala Female 🇱🇰)" },
-  { id: "si-LK-SameeraNeural", name: "Sameera (Sinhala Male 🇱🇰)" },
+  { id: "dialog-nipunika", name: "Dialog Nipunika (Studio Natural Sinhala Female 🇱🇰 ✨)" },
+  { id: "piper-openslr", name: "OpenSLR 30 (Sinhala Female 🇱🇰)" },
+  { id: "piper-ashoka", name: "Ashoka (Sinhala Male 🇱🇰)" },
+  { id: "si-LK-ThiliniNeural", name: "Thilini (Edge Sinhala Female 🇱🇰)" },
+  { id: "si-LK-SameeraNeural", name: "Sameera (Edge Sinhala Male 🇱🇰)" },
   { id: "en-US-JennyNeural", name: "Jenny (US English Female)" },
   { id: "en-US-GuyNeural", name: "Guy (US English Male)" },
-  { id: "en-GB-SoniaNeural", name: "Sonia (British English Female)" },
-  { id: "en-AU-NatashaNeural", name: "Natasha (Australian Female)" },
 ];
 
 export const AIAgentSettingsModal = ({ open, onOpenChange }: Props) => {

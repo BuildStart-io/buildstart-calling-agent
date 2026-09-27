@@ -13,8 +13,43 @@ type activeCall struct {
 	cm                *call.CallManager
 	bridge            *Bridge
 	agent             *agent.AIAgent
+	geminiLive        *agent.GeminiLiveAgent
 	callbackJID       types.JID
 	peerAudioReceived bool
+	audioListenersMu  sync.Mutex
+	audioListeners    map[int]func([]float32)
+	nextListenerID    int
+}
+
+func (ac *activeCall) PushAudio(pcm []float32) {
+	if ac.cm != nil {
+		ac.cm.FeedCapturedPCM(pcm)
+	}
+}
+
+func (ac *activeCall) addAudioListener(fn func([]float32)) func() {
+	ac.audioListenersMu.Lock()
+	if ac.audioListeners == nil {
+		ac.audioListeners = make(map[int]func([]float32))
+	}
+	id := ac.nextListenerID
+	ac.nextListenerID++
+	ac.audioListeners[id] = fn
+	ac.audioListenersMu.Unlock()
+
+	return func() {
+		ac.audioListenersMu.Lock()
+		delete(ac.audioListeners, id)
+		ac.audioListenersMu.Unlock()
+	}
+}
+
+func (ac *activeCall) broadcastAudio(pcm []float32) {
+	ac.audioListenersMu.Lock()
+	defer ac.audioListenersMu.Unlock()
+	for _, fn := range ac.audioListeners {
+		fn(pcm)
+	}
 }
 
 type callRegistry struct {

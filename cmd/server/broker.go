@@ -251,10 +251,12 @@ func (b *Broker) upsertCall(r CallRecord) {
 	}
 	b.mu.Unlock()
 	b.broadcastCallList()
+	streamURL := fmt.Sprintf("wss://wacaller.bandara.me/api/v1/calls/%s/audio", r.CallID)
 	b.broadcast(map[string]any{
-		"type": "call-status", "sessionId": r.SessionID, "id": r.CallID, "owner": r.Owner,
+		"type": "call-status", "sessionId": r.SessionID, "id": r.CallID, "callId": r.CallID, "call_id": r.CallID, "owner": r.Owner,
 		"status": r.Status, "peer": r.Peer, "peerNumber": r.PeerNumber, "direction": r.Direction,
 		"startedAt": r.StartedAt, "outcome": r.Outcome, "triggerReason": r.TriggerReason,
+		"stream_url": streamURL, "streamUrl": streamURL,
 	})
 }
 
@@ -330,7 +332,7 @@ func (b *Broker) endCall(id, reason string) {
 	b.mu.Unlock()
 
 	b.broadcast(map[string]any{
-		"type": "call-ended", "sessionId": sessionID, "id": id, "owner": owner, "reason": reason, "endedAt": now,
+		"type": "call-ended", "sessionId": sessionID, "id": id, "callId": id, "owner": owner, "reason": reason, "endedAt": now,
 		"durationSeconds": duration, "outcome": outcome,
 	})
 	b.broadcastCallList()
@@ -347,8 +349,11 @@ func (b *Broker) broadcastCallList() {
 }
 
 func (b *Broker) emitIncoming(sessionID, id, peer string) {
+	streamURL := fmt.Sprintf("wss://wacaller.bandara.me/api/v1/calls/%s/audio", id)
 	b.broadcast(map[string]any{
-		"type": "incoming", "sessionId": sessionID, "id": id, "peer": peer, "offeredAt": time.Now().UnixMilli(),
+		"type": "incoming", "sessionId": sessionID, "id": id, "callId": id, "call_id": id,
+		"peer": peer, "offeredAt": time.Now().UnixMilli(),
+		"stream_url": streamURL, "streamUrl": streamURL,
 	})
 }
 

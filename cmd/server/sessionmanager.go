@@ -83,6 +83,16 @@ func (m *SessionManager) infos() []SessionInfo {
 	return out
 }
 
+func (m *SessionManager) allSessions() []*Session {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := make([]*Session, 0, len(m.sessions))
+	for _, s := range m.sessions {
+		out = append(out, s)
+	}
+	return out
+}
+
 func (m *SessionManager) snapshotEvents() []any {
 	events := []any{map[string]any{"type": "session-list", "sessions": m.infos()}}
 	if m.agentConfig != nil {

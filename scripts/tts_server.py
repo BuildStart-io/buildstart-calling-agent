@@ -21,19 +21,70 @@ from flask import Flask, request, Response, jsonify
 
 app = Flask(__name__)
 piper_lock = threading.Lock()
+dialog_lock = threading.Lock()
 
 # Voice hierarchy:
-# 1. gemini-aoede / gemini-puck / gemini-charon (Google AI Studio Gemini Flash Native Voice - super-natural human voice)
-# 2. si-LK-ThiliniNeural (Microsoft Female Neural - warm, natural conversational voice)
-# 3. piper-ashoka (Local Human Voice by Ashoka Weerawardhana - 100% offline fallback)
+# 1. dialog-nipunika (Dialog Axiata & UoM Lab 22.05 kHz Studio Female - #1 Natural Sinhala Voice)
+# 2. piper-openslr (Google OpenSLR 30 High-Fidelity 22.05 kHz Neural Voice)
+# 3. piper-ashoka (Ashoka Weerawardhana Studio Voice - 16 kHz)
+# 4. gemini-aoede (Google AI Studio Gemini Flash Voice)
+# 5. si-LK-ThiliniNeural (Microsoft Female Neural)
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-DEFAULT_VOICE = os.environ.get("DEFAULT_VOICE", "gemini-aoede")
+DEFAULT_VOICE = os.environ.get("DEFAULT_VOICE", "dialog-nipunika")
 RATE_MODIFIER = "+4%"  # Conversational pace
 PITCH_MODIFIER = "+1Hz"
 ELEVENLABS_API_KEY = os.environ.get("ELEVENLABS_API_KEY", "")
 ELEVENLABS_VOICE_ID = os.environ.get("ELEVENLABS_VOICE_ID", "21m00Tcm4TlvDq8ikWAM")
 
-# Pre-load local Piper TTS models (Ashoka human voice)
+# Pre-load Dialog Axiata Nipunika Studio VITS model (210,000 steps, 22.05 kHz)
+dialog_synthesizer = None
+dialog_romanizer = None
+
+try:
+    from unittest.mock import MagicMock
+    sys.modules.setdefault("ko_speech_tools", MagicMock())
+
+    # 1. Alias monotonic align FIRST
+    VITS_TOOLS = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools", "finetune-hf-vits")
+    if VITS_TOOLS not in sys.path:
+        sys.path.insert(0, VITS_TOOLS)
+    try:
+        import monotonic_align
+        sys.modules.setdefault("monotonic_alignment_search", monotonic_align)
+    except Exception:
+        pass
+
+    # 2. Shims for transformers and torch
+    import torch
+    import transformers.pytorch_utils
+    transformers.pytorch_utils.isin_mps_friendly = getattr(torch, "isin", None)
+    import transformers.utils.import_utils
+    transformers.utils.import_utils.is_torchcodec_available = lambda: True
+
+    from huggingface_hub import hf_hub_download
+    from TTS.utils.synthesizer import Synthesizer
+    import importlib.util
+
+    print("🇱🇰 Initializing Dialog Axiata Nipunika Studio VITS (210,000 steps)...")
+    d_cfg = hf_hub_download("dialoglk/SinhalaVITS-TTS-F1", "Nipunika_config.json")
+    d_pth = hf_hub_download("dialoglk/SinhalaVITS-TTS-F1", "Nipunika_210000.pth")
+    d_rom = hf_hub_download("dialoglk/SinhalaVITS-TTS-F1", "romanizer.py")
+
+    dialog_synthesizer = Synthesizer(tts_checkpoint=d_pth, tts_config_path=d_cfg, use_cuda=False)
+    # Tune VITS model parameters for fluent connected speech (avoids word-by-word pauses)
+    if hasattr(dialog_synthesizer, "tts_model") and dialog_synthesizer.tts_model:
+        dialog_synthesizer.tts_model.length_scale = 1.15
+        dialog_synthesizer.tts_model.inference_noise_scale = 0.33
+
+    spec = importlib.util.spec_from_file_location("romanizer", d_rom)
+    dialog_romanizer = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(dialog_romanizer)
+
+    print("✨ Dialog Nipunika Studio Female Voice (22,050 Hz) Ready (Expressive Human Tuning Active)!")
+except Exception as e:
+    print(f"⚠️ Dialog Nipunika initialization notice: {e}")
+
+# Pre-load local Piper TTS models (OpenSLR & Ashoka)
 piper_voices = {}
 try:
     from huggingface_hub import hf_hub_download
@@ -52,7 +103,13 @@ try:
     p_uni_json = hf_hub_download('unicef/piper-si_LK-ashoka-medium', 'si_LK-ashoka-medium.onnx.json')
     piper_voices['piper-unicef'] = PiperVoice.load(p_uni_onnx, config_path=p_uni_json)
 
-    print("✅ Local Piper Human Voice models ready: ['piper-intellisr', 'piper-unicef']")
+    # 3. OpenSLR-30 high-fidelity 22.05 kHz Sinhala model (chan4lk/piper-tts-sinhala)
+    p_chan_onnx = hf_hub_download('chan4lk/piper-tts-sinhala', 'si_LK-sinhala-medium.onnx')
+    p_chan_json = hf_hub_download('chan4lk/piper-tts-sinhala', 'si_LK-sinhala-medium.onnx.json')
+    piper_voices['piper-openslr'] = PiperVoice.load(p_chan_onnx, config_path=p_chan_json)
+    piper_voices['piper-chan4lk'] = piper_voices['piper-openslr']
+
+    print("✅ Local Piper Human Voice models ready: ['piper-openslr', 'piper-intellisr', 'piper-unicef']")
 except Exception as e:
     print(f"⚠️ Piper models initialization notice: {e}")
 
@@ -72,6 +129,7 @@ NUM_MAP = {
 # Automatic conversion of bookish/formal words into warm spoken Sinhala
 COLLOQUIAL_MAP = [
     ('ඔබගේ', 'ඔයාගෙ'),
+    ('ඔබේ', 'ඔයාගේ'),
     ('ඔබට', 'ඔයාට'),
     ('ඔබව', 'ඔයාව'),
     ('ඔබෙන්', 'ඔයාගෙන්'),
@@ -91,23 +149,330 @@ COLLOQUIAL_MAP = [
 ]
 
 
+SRI_LANKAN_SPOKEN_LOANWORDS = {
+    # Tech, AI & Channels
+    "whatsapp": "වට්ස්ඇප්",
+    "ai": "ඒඅයි",
+    "buildstart": "බිල්ඩ්ස්ටාර්ට්",
+    "sms": "එස්එම්එස්",
+    "bot": "බොට්",
+    "bots": "බොට්ස්",
+    "chatbot": "චැට්බොට්",
+    "chatbots": "චැට්බොට්ස්",
+    "crm": "සීආර්එම්",
+    "web": "වෙබ්",
+    "website": "වෙබ්සයිට්",
+    "websites": "වෙබ්සයිට්ස්",
+    "app": "ඇප්",
+    "apps": "ඇප්ස්",
+    "software": "සොෆ්ට්වෙයාර්",
+    "online": "ඔන්ලයින්",
+    "offline": "ඕෆ්ලයින්",
+    "cloud": "ක්ලවුඩ්",
+    "server": "සර්වර්",
+    "servers": "සර්වර්ස්",
+    "system": "සිස්ටම්",
+    "systems": "සිස්ටම්ස්",
+    "link": "ලින්ක්",
+    "links": "ලින්ක්ස්",
+    "data": "ඩේටා",
+    "dashboard": "ඩෑෂ්බෝඩ්",
+    "api": "ඒපීඅයි",
+    "tool": "ටූල්",
+    "tools": "ටූල්ස්",
+    "platform": "ප්ලැට්ෆෝම්",
+    "platforms": "ප්ලැට්ෆෝම්ස්",
+    "code": "කෝඩ්",
+    "script": "ස්ක්‍රිප්ට්",
+    "internet": "ඉන්ටර්නෙට්",
+    "network": "නෙට්වර්ක්",
+    "device": "ඩිවයිස්",
+    "devices": "ඩිවයිසස්",
+
+    # Calling, Sales & Business Operations
+    "call": "කෝල්",
+    "calls": "කෝල්ස්",
+    "calling": "කෝලිං",
+    "caller": "කෝලර්",
+    "callers": "කෝලර්ස්",
+    "customer": "කස්ටමර්",
+    "customers": "කස්ටමර්ස්",
+    "client": "ක්ලයන්ට්",
+    "clients": "ක්ලයන්ට්ස්",
+    "business": "බිස්නස්",
+    "businesses": "බිස්නස්",
+    "service": "සර්විස්",
+    "services": "සර්විසස්",
+    "team": "ටීම්",
+    "teams": "ටීම්ස්",
+    "member": "මෙම්බර්",
+    "members": "මෙම්බර්ස්",
+    "staff": "ස්ටාෆ්",
+    "agent": "ඒජන්ට්",
+    "agents": "ඒජන්ට්ස්",
+    "lead": "ලීඩ්",
+    "leads": "ලීඩ්ස්",
+    "deal": "ඩීල්",
+    "deals": "ඩීල්ස්",
+    "close": "ක්ලෝස්",
+    "closing": "ක්ලෝසින්",
+    "closed": "ක්ලෝස්ඩ්",
+    "sales": "සේල්ස්",
+    "marketing": "මාකටින්",
+    "package": "පැකේජ්",
+    "packages": "පැකේජස්",
+    "plan": "ප්ලෑන්",
+    "plans": "ප්ලෑන්ස්",
+    "starter": "ස්ටාටර්",
+    "pro": "ප්‍රෝ",
+    "enterprise": "එන්ටර්ප්‍රයිස්",
+    "standard": "ස්ටෑන්ඩර්ඩ්",
+    "demo": "ඩෙමෝ",
+    "demos": "ඩෙමෝස්",
+    "account": "එකවුන්ට්",
+    "accounts": "එකවුන්ට්ස්",
+    "order": "ඕඩර්",
+    "orders": "ඕඩර්ස්",
+    "ordering": "ඕඩරින්",
+    "detail": "විස්තර",
+    "details": "විස්තර",
+    "support": "සපෝට්",
+    "help": "උදව්",
+    "check": "චෙක්",
+    "setup": "සෙටප්",
+    "update": "අප්ඩේට්",
+    "updates": "අප්ඩේට්ස්",
+    "updating": "අප්ඩේටින්",
+    "confirm": "කන්ෆර්ම්",
+    "confirmed": "කන්ෆර්ම්ඩ්",
+    "confirmation": "කන්ෆර්මේෂන්",
+    "cancel": "කැන්සල්",
+    "canceled": "කැන්සල්ඩ්",
+    "cancellation": "කැන්සලේෂන්",
+    "booking": "බුකින්",
+    "bookings": "බුකින්ස්",
+    "book": "බුක්",
+    "booked": "බුක්ඩ්",
+    "appointment": "ඇපොයින්ට්මන්ට්",
+    "appointments": "ඇපොයින්ට්මන්ට්ස්",
+    "meeting": "මීටින්",
+    "meetings": "මීටින්ස්",
+    "schedule": "ෂෙඩියුල්",
+    "schedules": "ෂෙඩියුල්ස්",
+    "scheduled": "ෂෙඩියුල්ඩ්",
+    "scheduling": "ෂෙඩියුලින්",
+    "automate": "ඔටෝමේට්",
+    "automates": "ඔටෝමේට්",
+    "automation": "ඔටෝමේෂන්",
+    "automations": "ඔටෝමේෂන්ස්",
+    "automatic": "ඔටෝමැටික්",
+    "automated": "ඔටෝමේටඩ්",
+    "automating": "ඔටෝමේටින්",
+    "workflow": "වර්ක්ෆ්ලෝ",
+    "workflows": "වර්ක්ෆ්ලෝස්",
+    "message": "මැසේජ්",
+    "messages": "මැසේජස්",
+    "messaging": "මැසේජින්",
+    "connect": "කනෙක්ට්",
+    "connected": "කනෙක්ටඩ්",
+    "connecting": "කනෙක්ටින්",
+    "response": "රිස්පොන්ස්",
+    "responses": "රිස්පොන්සස්",
+    "respond": "රිස්පොන්ඩ්",
+    "instant": "ඉන්ස්ටන්ට්",
+    "test": "ටෙස්ට්",
+    "testing": "ටෙස්ටින්",
+    "followup": "ෆලෝඅප්",
+    "followups": "ෆලෝඅප්ස්",
+    "follow": "ෆලෝ",
+    "reminders": "රිමයින්ඩර්ස්",
+    "reminder": "රිමයින්ඩර්",
+    "screen": "ස්ක්‍රීන්",
+    "qualify": "කොලිෆයි",
+    "qualified": "කොලිෆයිඩ්",
+    "qualifying": "කොලිෆයිං",
+    "handle": "හැන්ඩ්ල්",
+    "handling": "හැන්ඩ්ලින්",
+    "retail": "රීටේල්",
+    "admissions": "ඇඩ්මිෂන්ස්",
+    "admission": "ඇඩ්මිෂන්",
+    "hotel": "හොටෙල්",
+    "hotels": "හොටෙල්ස්",
+    "feature": "ෆීචර්",
+    "features": "ෆීචර්ස්",
+    "notification": "නොටිෆිකේෂන්",
+    "notifications": "නොටිෆිකේෂන්ස්",
+    "contact": "කොන්ටැක්ට්",
+    "contacts": "කොන්ටැක්ට්ස්",
+    "number": "නම්බර්",
+    "numbers": "නම්බර්ස්",
+    "direct": "ඩිරෙක්ට්",
+    "price": "ගාණ",
+    "prices": "ගණන්",
+    "pricing": "ප්‍රයිසින්",
+    "charge": "චාර්ජ්",
+    "charges": "චාර්ජස්",
+    "discount": "ඩිස්කවුන්ට්",
+    "company": "කම්පැනි",
+    "office": "ඔෆිස්",
+    "channel": "චැනල්",
+    "channels": "චැනල්ස්",
+    "manager": "මැනේජර්",
+    "management": "මැනේජ්මන්ට්",
+    "manage": "මැනේජ්",
+    "developer": "ඩිවලොපර්",
+    "process": "ප්‍රොසෙස්",
+    "product": "ප්‍රොඩක්ට්",
+    "products": "ප්‍රොඩක්ට්ස්",
+    "integration": "ඉන්ටග්‍රේෂන්",
+    "integrations": "ඉන්ටග්‍රේෂන්ස්",
+
+    # Conversational & Daily Spoken
+    "ok": "ඕකේ",
+    "okay": "ඕකේ",
+    "yes": "ඔව්",
+    "no": "නෑ",
+    "hello": "හෙලෝ",
+    "hi": "හායි",
+    "hey": "හේයි",
+    "bye": "බායි",
+    "thanks": "තෑන්ක්ස්",
+    "thank": "තෑන්ක්",
+    "you": "යූ",
+    "welcome": "වෙල්කම්",
+    "sorry": "සොරි",
+    "sure": "ෂුවර්",
+    "super": "සුපර්",
+    "perfect": "පර්ෆෙක්ට්",
+    "good": "ගුඩ්",
+    "fine": "ෆයින්",
+    "nice": "නයිස්",
+    "great": "ග්‍රේට්",
+    "today": "අද",
+    "tomorrow": "හෙට",
+    "now": "දැන්",
+    "live": "ලයිව්",
+    "real": "රියල්",
+    "ready": "රෙඩි",
+    "start": "ස්ටාට්",
+    "stop": "ස්ටොප්",
+    "done": "ඩන්",
+    "voice": "වොයිස්",
+}
+
+
+def transliterate_loanword_algorithmic(word: str) -> str:
+    """Fallback phonetic conversion of unmapped English words into clean Sinhala characters for Nipunika."""
+    w = word.lower().strip()
+    if not w:
+        return ""
+    if w in SRI_LANKAN_SPOKEN_LOANWORDS:
+        return SRI_LANKAN_SPOKEN_LOANWORDS[w]
+
+    # Handle common prefixes
+    if w.startswith("auto"):
+        return "ඔටෝ" + transliterate_loanword_algorithmic(w[4:])
+    elif w.startswith("tele"):
+        return "ටෙලි" + transliterate_loanword_algorithmic(w[4:])
+    elif w.startswith("inter"):
+        return "ඉන්ටර්" + transliterate_loanword_algorithmic(w[5:])
+    elif w.startswith("micro"):
+        return "මයික්‍රෝ" + transliterate_loanword_algorithmic(w[5:])
+    elif w.startswith("super"):
+        return "සුපර්" + transliterate_loanword_algorithmic(w[5:])
+
+    # Multi-letter phonetic patterns
+    phonetic_patterns = [
+        (r'tions?\b', 'ෂන්ස්' if w.endswith('s') else 'ෂන්'),
+        (r'sions?\b', 'ෂන්ස්' if w.endswith('s') else 'ෂන්'),
+        (r'ments?\b', 'මන්ට්ස්' if w.endswith('s') else 'මන්ට්'),
+        (r'ings?\b', 'ඉන්ස්' if w.endswith('s') else 'ඉන්'),
+        (r'ables?\b', 'බල්ස්' if w.endswith('s') else 'බල්'),
+        (r'ibles?\b', 'බල්ස්' if w.endswith('s') else 'බල්'),
+        (r'nesses?\b', 'නසස්' if w.endswith('es') else 'නස්'),
+        (r'ness\b', 'නස්'),
+        (r'ives?\b', 'ඉව්ස්' if w.endswith('s') else 'ඉව්'),
+        (r'ers?\b', 'ර්ස්' if w.endswith('s') else 'ර්'),
+        (r'ors?\b', 'ර්ස්' if w.endswith('s') else 'ර්'),
+        (r'ists?\b', 'ඉස්ට්ස්' if w.endswith('s') else 'ඉස්ට්'),
+        (r'ics?\b', 'ඉක්ස්' if w.endswith('s') else 'ඉක්'),
+        (r'ities?\b', 'ඉටීස්' if w.endswith('ies') else 'ඉටි'),
+        (r'ity\b', 'ඉටි'),
+        (r'fully\b', 'ෆුලි'),
+        (r'ful\b', 'ෆුල්'),
+        (r'ed\b', 'ඩ්'),
+    ]
+    for pat, rep in phonetic_patterns:
+        w = re.sub(pat, rep, w)
+
+    # Phonetic mappings for non-Sinhala letters to ensure Nipunika vocabulary compatibility
+    w = w.replace('w', 'v').replace('q', 'k').replace('x', 'ks').replace('z', 's')
+    w = w.replace('th', 't').replace('sh', 's').replace('ch', 'c').replace('ph', 'f')
+    return w
+
+
+def enhance_prosody(t: str) -> str:
+    """Ensure natural fluent phrasing without word-by-word chopping."""
+    # Completely remove all apostrophes and single quotes (they trigger glottal stops in VITS)
+    t = t.replace("'", "").replace("`", "").replace("’", "").replace("‘", "")
+
+    # Natural conversational starter (only a single gentle comma at the start of sentence)
+    starters = [
+        ("ආ හරි", "ආ හරි,"),
+        ("අහ් හරි", "අහ් හරි,"),
+        ("හරි බලමුකො", "හරි බලමුකො,"),
+        ("ඒක තමයි", "ඒක තමයි,"),
+        ("ඔව් අනිවාර්යයෙන්ම", "ඔව් අනිවාර්යයෙන්ම,"),
+        ("අනිවාර්යයෙන්ම", "අනිවාර්යයෙන්ම,"),
+        ("ඕකේ", "ඕකේ,"),
+        ("ඔව්", "ඔව්,"),
+        ("හරි", "හරි,"),
+        ("ආ", "ආ,"),
+    ]
+    starters.sort(key=lambda x: len(x[0]), reverse=True)
+
+    for orig, rep in starters:
+        t = re.sub(rf"^{orig}(\s+)(?![,])", rf"{rep} ", t)
+        t = re.sub(rf"([.!?])\s*{orig}(\s+)(?![,])", rf"\1 {rep} ", t)
+
+    # Clean double commas and trailing punctuation
+    t = re.sub(r",\s*,+", ",", t)
+    t = re.sub(r"\s+([,.!?])", r"\1", t)
+    return t
+
+
 def normalize_text(text: str) -> str:
-    """Preprocess and clean text for natural spoken Sinhala phonemization."""
+    """Preprocess text for fluent, connected spoken Sinhala with co-articulation and no word-by-word pauses."""
     if not text:
         return ""
 
-    # Strip markdown symbols, asterisks, brackets, and emojis
-    text = re.sub(r'[*#_`~]', '', text)
+    # Strip markdown symbols, asterisks, brackets, quotes, and emojis
+    text = re.sub(r'[*#_`~\'\"’‘]', '', text)
 
-    # Convert numeric digits to spoken Sinhala words
+    # 1. Convert English loanwords to crisp natural Sri Lankan spoken pronunciation
+    def _replace_loanword(m):
+        raw = m.group(0).lower()
+        if raw in SRI_LANKAN_SPOKEN_LOANWORDS:
+            return " " + SRI_LANKAN_SPOKEN_LOANWORDS[raw] + " "
+        return " " + transliterate_loanword_algorithmic(raw) + " "
+
+    text = re.sub(r'[A-Za-z]+', _replace_loanword, text)
+
+    # 2. Convert numeric digits to spoken Sinhala words
     for digit, word in NUM_MAP.items():
         text = text.replace(digit, f" {word} ")
 
-    # Normalize bookish/written words to natural spoken Sinhala
+    # 3. Normalize bookish/written words to natural spoken Sinhala
     for formal, spoken in COLLOQUIAL_MAP:
         text = text.replace(formal, spoken)
 
-    # Normalize multiple dots and dashes into natural breath pauses
+    # 4. Strip internal commas inside short lists to maintain continuous vocal flow
+    text = re.sub(r'(?<=[^\s,.!?]),(?=[^\s,.!?])', ' ', text)
+
+    # 5. Apply smooth prosody
+    text = enhance_prosody(text)
+
+    # 6. Normalize multiple dots into gentle pauses and clean whitespace
     text = re.sub(r'\.{2,}', ', ', text)
     text = re.sub(r'[-–—]', ' ', text)
     text = re.sub(r'\s+', ' ', text).strip()
@@ -298,9 +663,27 @@ def synthesize_edge_tts(text: str, voice: str = DEFAULT_VOICE, rate: str = RATE_
         loop.close()
 
 
-def synthesize_piper(text: str, voice_key: str = "piper-intellisr") -> bytes:
-    """Synthesize speech using local Piper ONNX models (Ashoka Weerawardhana)."""
-    p_voice = piper_voices.get(voice_key) or piper_voices.get("piper-intellisr") or piper_voices.get("piper-unicef")
+def synthesize_dialog_nipunika(text: str) -> bytes:
+    """Synthesize speech using Dialog Axiata Nipunika VITS (22,050 Hz Studio Quality)."""
+    if not dialog_synthesizer or not dialog_romanizer:
+        raise RuntimeError("Dialog Nipunika model is not loaded")
+    roman_text = dialog_romanizer.sinhala_to_roman(text)
+    with dialog_lock:
+        wav = dialog_synthesizer.tts(roman_text)
+        buf = io.BytesIO()
+        dialog_synthesizer.save_wav(wav, buf)
+    buf.seek(0)
+    return buf.read()
+
+
+def synthesize_piper(text: str, voice_key: str = "piper-openslr") -> bytes:
+    """Synthesize speech using local Piper ONNX models."""
+    p_voice = (
+        piper_voices.get(voice_key)
+        or piper_voices.get("piper-openslr")
+        or piper_voices.get("piper-intellisr")
+        or piper_voices.get("piper-unicef")
+    )
     if not p_voice:
         raise RuntimeError(f"Piper voice '{voice_key}' not found and no piper voices loaded")
 
@@ -331,15 +714,14 @@ def synthesize_piper(text: str, voice_key: str = "piper-intellisr") -> bytes:
 def health():
     return jsonify({
         "status": "ok",
-        "primary_engine": "google-aistudio-gemini-tts" if GEMINI_API_KEY else "microsoft-neural",
+        "primary_engine": "dialog-nipunika-vits" if dialog_synthesizer else "piper-neural",
         "default_voice": DEFAULT_VOICE,
         "available_voices": [
+            "dialog-nipunika (Dialog Axiata & UoM Lab 22.05 kHz Studio Female - #1 Natural Voice)",
+            "piper-openslr (Google OpenSLR 30 High-Fidelity 22.05 kHz Neural Voice)",
+            "piper-ashoka (Ashoka Weerawardhana Studio Voice - 16 kHz)",
             "gemini-aoede (Google AI Studio Super-Natural Female)",
-            "gemini-puck (Google AI Studio Super-Natural Male)",
-            "gemini-charon (Google AI Studio Super-Natural Deep Male)",
-            "si-LK-ThiliniNeural (Microsoft Female Neural - Free)",
-            "si-LK-SameeraNeural (Male Neural - Free)",
-            "piper-ashoka (Ashoka Weerawardhana Human Voice - 100% Offline & Free)"
+            "si-LK-ThiliniNeural (Microsoft Female Neural - Free)"
         ]
     })
 
@@ -355,18 +737,32 @@ def synthesize():
     if not text:
         return Response(b"", mimetype="audio/mpeg")
 
-    # 0. Primary: Google AI Studio Gemini Flash Native Voice (Super-Natural Human Voice)
-    if GEMINI_API_KEY and ("gemini" in voice.lower() or voice.lower() in ["aoede", "puck", "charon", "kore", "fenrir"]):
-        try:
-            audio_wav = synthesize_gemini_tts(text, voice=voice)
-            if audio_wav and len(audio_wav) > 100:
-                return Response(audio_wav, mimetype="audio/wav")
-        except Exception as g_err:
-            print(f"❌ Gemini Flash AI Voice error: {g_err}")
-            return jsonify({"error": f"Gemini AI voice synthesis failed: {g_err}"}), 502
+    print(f"🎙️ [TTS] In: {raw_text!r} -> Norm: {text!r}")
 
-    # If piper voice is requested directly
-    if "piper" in voice.lower() or "ashoka" in voice.lower():
+    has_english = bool(re.search(r'[A-Za-z]{2,}', text))
+
+    # 0. ElevenLabs Custom Voice Clone (Multilingual v2)
+    if (voice.lower() == "elevenlabs" or DEFAULT_VOICE == "elevenlabs") and ELEVENLABS_API_KEY:
+        try:
+            audio_mp3 = synthesize_elevenlabs(text, voice_id=ELEVENLABS_VOICE_ID)
+            if audio_mp3 and len(audio_mp3) > 100:
+                print(f"✨ [TTS ELEVENLABS] Synthesized {len(audio_mp3)} bytes")
+                return Response(audio_mp3, mimetype="audio/mpeg")
+        except Exception as el_err:
+            print(f"⚠️ ElevenLabs voice clone error: {el_err}, falling back...")
+
+    # 1. Primary: Dialog Axiata Nipunika Studio Voice (22.05 kHz Studio Human Quality)
+    if "dialog" in voice.lower() or "nipunika" in voice.lower() or voice.lower() == "dialog-nipunika" or (dialog_synthesizer and not any(k in voice.lower() for k in ["gemini", "piper", "ashoka", "si-lk", "thilini", "sameera"])):
+        try:
+            audio_wav = synthesize_dialog_nipunika(text)
+            if audio_wav and len(audio_wav) > 100:
+                print(f"✨ [TTS NIPUNIKA] Synthesized {len(audio_wav)} bytes")
+                return Response(audio_wav, mimetype="audio/wav")
+        except Exception as d_err:
+            print(f"⚠️ Dialog Nipunika error: {d_err}, falling back to Piper OpenSLR...")
+
+    # 3. Offline High-Fidelity Neural Fallback: Piper OpenSLR / Ashoka
+    if "piper" in voice.lower() or "ashoka" in voice.lower() or "openslr" in voice.lower():
         try:
             audio_wav = synthesize_piper(text, voice_key=voice)
             if audio_wav:
@@ -374,7 +770,16 @@ def synthesize():
         except Exception as p_err:
             print(f"⚠️ Piper synthesis error: {p_err}, falling back to Edge Neural...")
 
-    # Secondary: High-fidelity Microsoft Neural Voice (Thilini / Sameera)
+    # 4. Optional: Google AI Studio Gemini Flash Native Voice
+    if GEMINI_API_KEY and ("gemini" in voice.lower() or voice.lower() in ["aoede", "puck", "charon", "kore", "fenrir"]):
+        try:
+            audio_wav = synthesize_gemini_tts(text, voice=voice)
+            if audio_wav and len(audio_wav) > 100:
+                return Response(audio_wav, mimetype="audio/wav")
+        except Exception as g_err:
+            print(f"❌ Gemini Flash AI Voice error: {g_err}")
+
+    # 5. Secondary: High-fidelity Microsoft Neural Voice (Thilini / Sameera)
     edge_voice = voice if "si-lk" in voice.lower() else "si-LK-ThiliniNeural"
     try:
         audio_mp3 = synthesize_edge_tts(text, voice=edge_voice)
@@ -383,7 +788,7 @@ def synthesize():
     except Exception as edge_err:
         print(f"⚠️ Edge Neural TTS error: {edge_err}, falling back to Piper...")
 
-    # Fallback: Local Piper ONNX
+    # 6. Ultimate Fallback: Local Piper ONNX
     try:
         audio_wav = synthesize_piper(text)
         if audio_wav:

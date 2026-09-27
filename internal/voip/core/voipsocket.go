@@ -29,4 +29,6 @@ type VoipSocket interface {
 	GetTCToken(ctx context.Context, jid types.JID) ([]byte, error)
 
 	ResolveLIDForPN(ctx context.Context, pn types.JID) types.JID
+
+	ResolvePNForLID(ctx context.Context, lid types.JID) types.JID
 }

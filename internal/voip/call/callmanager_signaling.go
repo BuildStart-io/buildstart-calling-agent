@@ -297,6 +297,15 @@ func (m *CallManager) HandleCallAck(ctx context.Context, node *waBinary.Node) {
 	}
 	if e := wanode.AttrString(node.Attrs, "error"); e != "" {
 		m.log.Error("offer ack error", "error", e)
+		m.mu.Lock()
+		if m.currentCall != nil {
+			_ = m.currentCall.ApplyTransition(Transition{
+				Type:   TransitionTerminated,
+				Reason: core.EndCallReason(fmt.Sprintf("offer_rejected_%s", e)),
+			})
+			m.emitState()
+		}
+		m.mu.Unlock()
 		return
 	}
 	parsed := signaling.ParseRelayFromAck(node)

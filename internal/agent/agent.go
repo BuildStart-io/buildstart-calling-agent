@@ -47,7 +47,6 @@ type AIAgent struct {
 	prewarmMu          sync.Mutex
 	cachedGreetingPCM  []float32
 	cachedGreetingText string
-	cachedFillerPCM    []float32
 	customGreeting     string
 
 	// Output callback to inject 16 kHz Float32 PCM back into WhatsApp CallManager
@@ -62,7 +61,7 @@ func NewAIAgent(openRouterKey, model, systemPrompt string, log *slog.Logger) *AI
 		log = slog.Default()
 	}
 	orClient := NewOpenRouterClient(openRouterKey, model, systemPrompt)
-	ttsClient := NewMultiTTS("gemini-aoede")
+	ttsClient := NewMultiTTS("dialog-nipunika")
 	sttClient := NewWhisperSTT("", "")
 	vad := NewVAD(DefaultVADConfig())
 
@@ -84,7 +83,7 @@ func NewAIAgent(openRouterKey, model, systemPrompt string, log *slog.Logger) *AI
 	if data, err := os.ReadFile(greetingPath); err == nil {
 		if pcm, err := ParseWAV(data); err == nil && len(pcm) > 0 {
 			a.cachedGreetingPCM = pcm
-			a.cachedGreetingText = "හෙලෝ, ආයුබෝවන්! බිල්ඩ්ස්ටාර්ට් එකට සාදරයෙන් පිළිගන්නවා. අපි ඔයාගේ බිස්නස් එකට WhatsApp හරහා පැය විසිහතරෙම වැඩ කරන සැබෑ AI ටීම් මෙම්බර් කෙනෙක්ව හදලා දෙනවා — මේක නිකන්ම චැට්බොට් එකක් නෙවෙයි. කියන්නකො, අපේ සේවාවන් ගැන මොනවද ඔයාට දැනගන්න ඕනෙ?"
+			a.cachedGreetingText = "ආයුබෝවන්, BuildStart එකට සාදරයෙන් පිලිගන්නවා! කොහොමද මට ඔයාට උදව් කරන්න පුලුවන්?"
 			a.prewarmPCM = pcm
 			a.log.Info("pre-recorded Buildstart greeting loaded from disk", "path", greetingPath, "samples", len(pcm))
 		} else {
@@ -92,15 +91,6 @@ func NewAIAgent(openRouterKey, model, systemPrompt string, log *slog.Logger) *AI
 		}
 	} else {
 		a.log.Warn("pre-recorded greeting file not found", "path", greetingPath, "err", err)
-	}
-
-	// Load pre-recorded Sinhala filler ("ආ හරි...") for zero-perceived response latency
-	fillerPath := "assets/sounds/filler_sinhala_1.wav"
-	if data, err := os.ReadFile(fillerPath); err == nil {
-		if pcm, err := ParseWAV(data); err == nil && len(pcm) > 0 {
-			a.cachedFillerPCM = pcm
-			a.log.Info("pre-recorded Sinhala filler loaded from disk", "path", fillerPath, "samples", len(pcm))
-		}
 	}
 
 	a.setupVAD()
@@ -129,17 +119,6 @@ func (a *AIAgent) handleCallerSpeech(pcm []float32, wav []byte) {
 	defer a.speechLock.Unlock()
 
 	a.setState(StateThinking)
-
-	// Immediately stream a natural brief filler ("ආ හරි...") in the background
-	// so the caller gets instant human feedback (< 100ms) instead of dead silence!
-	if len(a.cachedFillerPCM) > 0 {
-		go func() {
-			time.Sleep(80 * time.Millisecond)
-			if a.GetState() == StateThinking && !a.isSpeaking.Load() {
-				a.streamAudioToCall(a.cachedFillerPCM)
-			}
-		}()
-	}
 
 	// Concurrently query intelligence
 	type chatResult struct {
@@ -172,7 +151,7 @@ func (a *AIAgent) handleCallerSpeech(pcm []float32, wav []byte) {
 
 	if err != nil || replyText == "" {
 		a.log.Error("OpenRouter response empty", "err", err)
-		replyText = "මම අසා සිටිමි, කියන්නකො."
+		replyText = "ආ' හරි, කියන්නකො', මම අහගෙන ඉන්නේ."
 	}
 
 	a.log.Info("AI response generated", "transcription", transcription, "reply", replyText)
@@ -231,7 +210,7 @@ func (a *AIAgent) PrewarmGreeting() {
 	}
 	a.prewarmMu.Unlock()
 
-	greeting := "හෙලෝ, ආයුබෝවන්! බිල්ඩ්ස්ටාර්ට් එකට සාදරයෙන් පිළිගන්නවා. අපි ඔයාගේ බිස්නස් එකට WhatsApp හරහා පැය විසිහතරෙම වැඩ කරන සැබෑ AI ටීම් මෙම්බර් කෙනෙක්ව හදලා දෙනවා — මේක නිකන්ම චැට්බොට් එකක් නෙවෙයි. කියන්නකො, අපේ සේවාවන් ගැන මොනවද ඔයාට දැනගන්න ඕනෙ?"
+	greeting := "හෙලෝ, ආයුබෝවන්! බිල්ඩ්ස්ටාර්ට් එකට සාදරයෙන් පිළිගන්නවා. කියන්නකො, කොහොමද මම අද උදව් කරන්න පුළුවන්?"
 	if strings.HasPrefix(a.tts.GetVoice(), "en-") {
 		greeting = "Hello! How can I help you today?"
 	}
@@ -262,7 +241,7 @@ func (a *AIAgent) GreetCaller() {
 		a.speechLock.Lock()
 		defer a.speechLock.Unlock()
 
-		greeting := "හෙලෝ, ආයුබෝවන්! බිල්ඩ්ස්ටාර්ට් එකට සාදරයෙන් පිළිගන්නවා. අපි ඔයාගේ බිස්නස් එකට WhatsApp හරහා පැය විසිහතරෙම වැඩ කරන සැබෑ AI ටීම් මෙම්බර් කෙනෙක්ව හදලා දෙනවා — මේක නිකන්ම චැට්බොට් එකක් නෙවෙයි. කියන්නකො, අපේ සේවාවන් ගැන මොනවද ඔයාට දැනගන්න ඕනෙ?"
+		greeting := "හෙලෝ, ආයුබෝවන්! බිල්ඩ්ස්ටාර්ට් එකට සාදරයෙන් පිළිගන්නවා. කියන්නකො, කොහොමද මම අද උදව් කරන්න පුළුවන්?"
 		if strings.HasPrefix(a.tts.GetVoice(), "en-") {
 			greeting = "Hello! How can I help you today?"
 		}
@@ -301,13 +280,18 @@ func (a *AIAgent) GreetCaller() {
 }
 
 func (a *AIAgent) streamAudioToCall(pcm []float32) {
+	a.streamAudioWithCooldown(pcm, 250*time.Millisecond)
+}
+
+func (a *AIAgent) streamAudioWithCooldown(pcm []float32, cooldown time.Duration) {
 	a.streamMu.Lock()
 	defer a.streamMu.Unlock()
 
 	a.isSpeaking.Store(true)
 	defer func() {
-		// Cooldown period after speech ends to prevent speaker echo triggering VAD
-		time.Sleep(350 * time.Millisecond)
+		if cooldown > 0 {
+			time.Sleep(cooldown)
+		}
 		a.vad.Reset()
 		a.isSpeaking.Store(false)
 	}()

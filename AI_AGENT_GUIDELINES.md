@@ -123,9 +123,10 @@ Located in [`internal/agent/openrouter.go`](file:///Users/yasiru/Documents/CALL/
 
 ### 3. High-Fidelity Neural TTS
 Located in [`scripts/tts_server.py`](file:///Users/yasiru/Documents/CALL/scripts/tts_server.py) and [`internal/agent/tts.go`](file:///Users/yasiru/Documents/CALL/internal/agent/tts.go):
-* **Primary Engine:** Local Piper TTS (`si_LK-sinhala-medium.onnx`) running on port `5050`.
-* **Fallback Engines:** Azure Speech (`si-LK-ThiliniNeural` / `si-LK-SameeraNeural`), Google Cloud TTS, or OpenAI-compatible TTS.
-* **Phonetic & Number Normalization:** Automatic expansion of numbers and dates into spoken Sinhala words.
+* **Primary Engine:** Dialog Axiata & University of Moratuwa Nipunika Studio VITS (`dialog-nipunika`, 22,050 Hz, 210,000 steps) running on port `5050`.
+* **Offline Neural Fallbacks:** OpenSLR 30 Piper ONNX (`piper-openslr`, 22.05 kHz) and Ashoka Weerawardhana Studio Voice (`piper-ashoka`, 16 kHz).
+* **Cloud Fallback Engines:** Microsoft Edge Neural (`si-LK-ThiliniNeural` / `si-LK-SameeraNeural`), Google Cloud TTS, or Azure Speech.
+* **Phonetic & Number Normalization:** Automatic expansion of numbers, dates, and colloquial speech into spoken Sinhala words.
 
 ---
 

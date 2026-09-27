@@ -53,6 +53,7 @@ type relayConnection struct {
 type SctpRelayManager struct {
 	mu          sync.Mutex
 	connections map[string]*relayConnection
+	primaryID   string
 	log         *slog.Logger
 
 	audioSsrc        uint32
@@ -195,6 +196,13 @@ func (m *SctpRelayManager) connectToRelay(info RelayConfig) {
 				m.sendRaw(conn, resp)
 				m.log.Debug("sent stun binding response", "id", id)
 			}
+		} else if len(msg.Data) >= 12 {
+			m.mu.Lock()
+			if m.primaryID != id {
+				m.log.Info("switching primary media relay based on incoming peer audio", "primary", id)
+				m.primaryID = id
+			}
+			m.mu.Unlock()
 		}
 		if m.onReceive != nil {
 			m.onReceive(msg.Data)
@@ -371,13 +379,25 @@ func (m *SctpRelayManager) sendRaw(conn *relayConnection, data []byte) {
 
 func (m *SctpRelayManager) Broadcast(data []byte) {
 	m.mu.Lock()
-	conns := make([]*relayConnection, 0, len(m.connections))
-	for _, c := range m.connections {
-		conns = append(conns, c)
+	var target *relayConnection
+	if m.primaryID != "" {
+		if c, ok := m.connections[m.primaryID]; ok && c.state == relayStateOpen && c.channel != nil {
+			target = c
+		}
+	}
+	if target == nil {
+		for _, c := range m.connections {
+			if c.state == relayStateOpen && c.channel != nil {
+				target = c
+				m.primaryID = c.id
+				break
+			}
+		}
 	}
 	m.mu.Unlock()
-	for _, c := range conns {
-		m.sendRaw(c, data)
+
+	if target != nil {
+		m.sendRaw(target, data)
 	}
 }
 
@@ -411,6 +431,9 @@ func (m *SctpRelayManager) failConnection(conn *relayConnection) {
 		return
 	}
 	conn.state = relayStateFailed
+	if m.primaryID == conn.id {
+		m.primaryID = ""
+	}
 	delete(m.connections, conn.id)
 	m.mu.Unlock()
 	m.teardown(conn)
@@ -424,6 +447,9 @@ func (m *SctpRelayManager) closeConnection(id string) {
 		return
 	}
 	conn.state = relayStateClosed
+	if m.primaryID == id {
+		m.primaryID = ""
+	}
 	delete(m.connections, id)
 	m.mu.Unlock()
 	m.teardown(conn)
