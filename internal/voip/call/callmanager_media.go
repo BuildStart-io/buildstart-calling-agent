@@ -47,6 +47,23 @@ func (m *CallManager) IsPlayingAudio() bool {
 	return m.wasPlaying || len(m.playQueue) > 0 || (!m.lastPlayingAt.IsZero() && time.Since(m.lastPlayingAt) < 350*time.Millisecond)
 }
 
+// DrainPlaybackForTest simulates the RTP consumer thread draining playQueue at 16kHz
+func (m *CallManager) DrainPlaybackForTest(samples int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if len(m.playQueue) >= samples {
+		m.playQueue = m.playQueue[samples:]
+		m.wasPlaying = true
+		m.lastPlayingAt = time.Now()
+	} else if len(m.playQueue) > 0 {
+		m.playQueue = nil
+		m.wasPlaying = false
+		m.lastPlayingAt = time.Now()
+	} else {
+		m.wasPlaying = false
+	}
+}
+
 func (m *CallManager) sendOpusFrameLocked(opus []byte) {
 	if m.rtpSession == nil || m.srtpSession == nil {
 		return
