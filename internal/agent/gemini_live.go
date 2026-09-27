@@ -377,24 +377,30 @@ func (g *GeminiLiveAgent) readLoop() {
 	}
 }
 
-// writeAudioLoop streams incoming 16 kHz audio in 40ms frames over WebSocket to Gemini Live.
-// CRITICAL FIX FOR 5-SECOND FIRST MESSAGE DELAY:
-// When the caller finishes speaking their first utterance ("Hello"), WhatsApp enters DTX
-// (Discontinuous Transmission) and drops transmission from 50 packets/sec to 1 packet every 400ms.
-// If we only forward packets when they arrive, Gemini Live's audio clock is starved by 20x,
-// taking 5–8 wall-clock seconds before its cloud VAD detects end-of-speech!
-// By generating continuous 16kHz 40ms silence frames whenever WhatsApp is in DTX silence,
-// Gemini's audio clock advances in 1:1 real time, triggering ACTIVITY_END in ~300ms!
+// writeAudioLoop streams incoming 16 kHz audio directly to Gemini Live.
+//
+// Root-cause fix for broken voice recognition / silence issue:
+// Previously, writeAudioLoop buffered audio looking for 640 samples, while a 40ms ticker
+// ran concurrently and padded partial buffers with zeros or injected silence. Because WhatsApp
+// delivers ~60ms audio frames (960 samples), the ticker repeatedly sliced caller speech in half,
+// padded it with 20ms of zeros, and injected silence packets right in the middle of words.
+// This severely corrupted speech waveforms, causing Gemini to either hallucinate random languages
+// or fail VAD detection completely (leaving the bot silent).
+//
+// The fix:
+// 1. Every incoming audio frame from WhatsApp is forwarded immediately and contiguously to Gemini.
+// 2. The silence ticker only injects silence when WhatsApp is in DTX silence mode (i.e. no audio received for >= 75ms).
+// 3. Contiguous speech is NEVER zero-padded, truncated, or interleaved with silence.
 func (g *GeminiLiveAgent) writeAudioLoop() {
-	const frameSamples = 640 // 40ms at 16kHz Float32
+	const silenceFrameSamples = 640 // 40ms at 16kHz Float32
 	ticker := time.NewTicker(40 * time.Millisecond)
 	defer ticker.Stop()
 
-	silenceFrame := make([]float32, frameSamples)
+	silenceFrame := make([]float32, silenceFrameSamples)
 	silenceBytes := media.PCMFloat32ToInt16LE(silenceFrame)
 	silenceB64 := base64.StdEncoding.EncodeToString(silenceBytes)
 
-	buf := make([]float32, 0, 1920)
+	var lastAudioReceivedAt time.Time
 
 	sendPayload := func(b64Audio string) {
 		payload := map[string]any{
@@ -429,27 +435,22 @@ func (g *GeminiLiveAgent) writeAudioLoop() {
 			if !g.callActive.Load() {
 				continue
 			}
-			buf = append(buf, pcm...)
-			for len(buf) >= frameSamples {
-				chunk := buf[:frameSamples]
-				bytes := media.PCMFloat32ToInt16LE(chunk)
-				buf = buf[frameSamples:]
+			if len(pcm) > 0 {
+				bytes := media.PCMFloat32ToInt16LE(pcm)
 				sendPayload(base64.StdEncoding.EncodeToString(bytes))
+				lastAudioReceivedAt = time.Now()
 			}
 		case <-ticker.C:
 			if !g.ready.Load() || !g.enabled.Load() || !g.callActive.Load() || g.closed.Load() {
 				continue
 			}
-			if len(buf) > 0 {
-				pad := make([]float32, frameSamples)
-				copy(pad, buf)
-				buf = buf[:0]
-				bytes := media.PCMFloat32ToInt16LE(pad)
-				sendPayload(base64.StdEncoding.EncodeToString(bytes))
-			} else {
-				// WhatsApp is in DTX silence mode: send 40ms silence to advance Gemini's audio clock in real time
-				sendPayload(silenceB64)
+			// WhatsApp sends ~60ms packets during speech.
+			// Only inject DTX silence if no audio has arrived for at least 75ms.
+			if !lastAudioReceivedAt.IsZero() && time.Since(lastAudioReceivedAt) < 75*time.Millisecond {
+				continue
 			}
+			// DTX silence mode: advance Gemini's audio clock in real time
+			sendPayload(silenceB64)
 		}
 	}
 }
