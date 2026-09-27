@@ -396,6 +396,7 @@ func (m *CallManager) HandleCallTerminate(node *waBinary.Node, from types.JID) {
 	m.log.Info("call terminated by peer", "call_id", call.CallID, "reason", string(reason))
 	_ = call.ApplyTransition(Transition{Type: TransitionTerminated, Reason: reason})
 	ended := call
+	m.currentCall = nil
 	m.emitState()
 	m.mu.Unlock()
 

@@ -399,6 +399,10 @@ func (s *Session) onIncomingOffer(ctx context.Context, evt *events.CallOffer) {
 				}
 			}
 			time.Sleep(1200 * time.Millisecond)
+			if ac, ok := s.reg.get(callID); !ok || ac.cm == nil || ac.cm.CurrentCall() == nil || ac.cm.CurrentCall().IsEnded() {
+				s.log.Info("call ended or canceled during ring delay; skipping auto-answer", "call_id", callID)
+				return
+			}
 			s.mgr.broker.recordCallEvent(callID, "accepting", "Accepting incoming call", "")
 			s.mgr.broker.emitIncomingClaimed(s.id, callID, "auto-answer")
 			if err := cm.AcceptCall(context.Background(), callID); err != nil {
@@ -462,10 +466,20 @@ func (s *Session) handleEvent(rawEvt any) {
 	case *events.CallTerminate:
 		if ac, ok := s.callForEvent(evt.From, evt.Data); ok {
 			ac.cm.HandleCallTerminate(wrapCall(evt.From, evt.Data), evt.From)
+		} else {
+			callID := callIDFromNode(wrapCall(evt.From, evt.Data))
+			if callID != "" {
+				s.mgr.broker.endCall(callID, "user_ended")
+			}
 		}
 	case *events.CallReject:
 		if ac, ok := s.callForEvent(evt.From, evt.Data); ok {
 			ac.cm.HandleCallTerminate(wrapCall(evt.From, evt.Data), evt.From)
+		} else {
+			callID := callIDFromNode(wrapCall(evt.From, evt.Data))
+			if callID != "" {
+				s.mgr.broker.endCall(callID, "declined")
+			}
 		}
 	}
 }

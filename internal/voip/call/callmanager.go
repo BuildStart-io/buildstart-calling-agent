@@ -154,6 +154,10 @@ func (m *CallManager) AcceptCall(ctx context.Context, callID string) error {
 		m.mu.Unlock()
 		return &CallError{"no incoming call with id " + callID}
 	}
+	if call.IsEnded() {
+		m.mu.Unlock()
+		return &CallError{"call already ended"}
+	}
 	if call.StateData.State == core.CallStateActive || call.StateData.State == core.CallStateConnecting {
 		m.mu.Unlock()
 		return nil
@@ -281,6 +285,7 @@ func (m *CallManager) RejectCall(ctx context.Context, callID string, reason core
 	}
 	_ = call.ApplyTransition(Transition{Type: TransitionLocalRejected, Reason: reason})
 	node := signaling.BuildRejectStanza(wanode.MustJID(call.PeerJid), call.CallID, wanode.MustJID(call.CallCreator))
+	m.currentCall = nil
 	m.emitState()
 	m.mu.Unlock()
 
@@ -299,6 +304,7 @@ func (m *CallManager) EndCall(ctx context.Context, reason core.EndCallReason) er
 	_ = call.ApplyTransition(Transition{Type: TransitionTerminated, Reason: reason})
 	node := signaling.BuildTerminateStanza(wanode.MustJID(call.PeerJid), call.CallID, wanode.MustJID(call.CallCreator))
 	ended := call
+	m.currentCall = nil
 	m.emitState()
 	m.mu.Unlock()
 

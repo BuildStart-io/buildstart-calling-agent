@@ -310,6 +310,9 @@ func (b *Broker) endCall(id, reason string) {
 	c, ok := b.calls[id]
 	if !ok {
 		b.mu.Unlock()
+		b.broadcast(map[string]any{
+			"type": "call-ended", "id": id, "callId": id, "reason": reason, "endedAt": time.Now().UnixMilli(),
+		})
 		return
 	}
 	now := time.Now().UnixMilli()
