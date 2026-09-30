@@ -120,9 +120,6 @@ func (s *Session) wireCall(cm *call.CallManager, callID string) {
 				if ac.geminiLive != nil {
 					ac.geminiLive.Close()
 				}
-				if ac.geminiLive != nil {
-					ac.geminiLive.Close()
-				}
 			}
 			s.removeCall(c.CallID)
 			s.mgr.broker.endCall(c.CallID, string(c.StateData.EndReason))
@@ -158,8 +155,6 @@ func (s *Session) wireCall(cm *call.CallManager, callID string) {
 			if ac, ok := s.reg.get(c.CallID); ok {
 				if ac.geminiLive != nil {
 					ac.geminiLive.TriggerGreeting()
-				} else if ac.geminiLive != nil && ac.geminiLive.IsEnabled() {
-					ac.geminiLive.TriggerGreeting()
 				}
 			}
 		}
@@ -173,10 +168,7 @@ func (s *Session) wireCall(cm *call.CallManager, callID string) {
 			callbackJID = ac.callbackJID
 			peerAudioReceived = ac.peerAudioReceived
 			if ac.geminiLive != nil {
-				ac.geminiLive.Close()
-			}
-			if ac.geminiLive != nil {
-				hadConversation = true
+				hadConversation = ac.geminiLive.HasSpokenWithPeer()
 				ac.geminiLive.Close()
 			}
 		}
@@ -248,8 +240,6 @@ func (s *Session) wireCall(cm *call.CallManager, callID string) {
 		}
 		if ac.bridge != nil {
 			_ = ac.bridge.WritePCM(pcm16)
-		}
-		if ac.geminiLive != nil && ac.geminiLive.IsEnabled() {
 		}
 	}
 }
@@ -399,6 +389,7 @@ func (s *Session) onIncomingOffer(ctx context.Context, evt *events.CallOffer) {
 			if err := cm.AcceptCall(context.Background(), callID); err != nil {
 				s.log.Error("failed to auto-answer incoming call", "call_id", callID, "err", err)
 				s.mgr.broker.recordCallEvent(callID, "accept_error", "Failed to answer call: "+err.Error(), "")
+				_ = cm.RejectCall(context.Background(), callID, core.EndCallReasonDeclined)
 			}
 		}()
 	}

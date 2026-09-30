@@ -53,6 +53,7 @@ type GeminiLiveAgent struct {
 	callActive        atomic.Bool
 	interruptedThisTurn atomic.Bool
 	isModelSpeaking     atomic.Bool
+	hasSpokenWithPeer   atomic.Bool
 	wsMu              sync.Mutex
 	resampleMu        sync.Mutex
 	resampler         *media.Resampler24kTo16k
@@ -557,6 +558,7 @@ func (g *GeminiLiveAgent) FeedCallerAudio(pcm16 []float32) {
 	if !g.enabled.Load() || g.closed.Load() || !g.callActive.Load() || len(pcm16) == 0 {
 		return
 	}
+	g.hasSpokenWithPeer.Store(true)
 	g.latMu.Lock()
 	g.lastCallerAudioAt = time.Now()
 	g.loggedLatencyThisTurn = false
@@ -587,6 +589,10 @@ func (g *GeminiLiveAgent) SetEnabled(enabled bool) {
 
 func (g *GeminiLiveAgent) IsEnabled() bool {
 	return g.enabled.Load()
+}
+
+func (g *GeminiLiveAgent) HasSpokenWithPeer() bool {
+	return g.hasSpokenWithPeer.Load()
 }
 
 func (g *GeminiLiveAgent) Close() {

@@ -167,6 +167,10 @@ func (m *CallManager) AcceptCall(ctx context.Context, callID string) error {
 		m.mu.Unlock()
 		return &CallError{"call cannot be accepted in state " + string(call.StateData.State)}
 	}
+	if call.EncryptionKey == nil {
+		m.mu.Unlock()
+		return &CallError{"cannot accept call: missing end-to-end encryption key from offer"}
+	}
 	_ = call.ApplyTransition(Transition{Type: TransitionLocalAccepted})
 	m.emitState()
 	key := call.EncryptionKey
