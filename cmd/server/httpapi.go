@@ -81,8 +81,7 @@ func (s *server) routes() http.Handler {
 	mux.HandleFunc("GET /api/sessions/{sid}/history", s.handleHistory)
 
 	// Agent Config
-	mux.HandleFunc("GET /api/agent/config", s.handleGetAgentConfig)
-	mux.HandleFunc("POST /api/agent/config", s.handleUpdateAgentConfig)
+
 	mux.HandleFunc("POST /api/sessions/{sid}/calls/{id}/agent", s.handleToggleCallAgent)
 
 	// Real-time Events (SSE)
@@ -200,7 +199,7 @@ func (s *server) handleLines(w http.ResponseWriter, r *http.Request) {
 		}
 		lines = append(lines, lineItem{
 			ID:        info.ID,
-			Name:      info.Name,
+			Name:      info.BusinessID,
 			Phone:     info.JID,
 			Status:    status,
 			State:     info.State,
@@ -224,14 +223,15 @@ func (s *server) handleSessionList(w http.ResponseWriter, r *http.Request) {
 
 func (s *server) handleSessionCreate(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		Name string `json:"name"`
+		BusinessID string `json:"business_id"`
 	}
 	_ = json.NewDecoder(r.Body).Decode(&body)
-	name := strings.TrimSpace(body.Name)
-	if name == "" {
-		name = "Session"
+	businessID := strings.TrimSpace(body.BusinessID)
+	if businessID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "business_id is required"})
+		return
 	}
-	id, err := s.sessions.Create(name)
+	id, err := s.sessions.Create(businessID)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
@@ -398,7 +398,7 @@ func (s *server) handleDirectDial(w http.ResponseWriter, r *http.Request) {
 
 	peerNum := sess.mgr.store.resolvePhone(peer.User)
 	s.broker.upsertCall(CallRecord{
-		SessionID: sess.id, CallID: callID, Owner: &owner, Direction: "outbound", Peer: peer.String(),
+		SessionID: sess.id, BusinessID: sess.businessID, CallID: callID, Owner: &owner, Direction: "outbound", Peer: peer.String(),
 		PeerNumber: peerNum, StartedAt: time.Now().UnixMilli(), Status: StatusRinging,
 	})
 
@@ -681,7 +681,7 @@ func (s *server) doStartCall(sess *Session, w http.ResponseWriter, r *http.Reque
 		return
 	}
 	s.broker.upsertCall(CallRecord{
-		SessionID: sess.id, CallID: callID, Owner: &owner, Direction: "outbound", Peer: peer.String(),
+		SessionID: sess.id, BusinessID: sess.businessID, CallID: callID, Owner: &owner, Direction: "outbound", Peer: peer.String(),
 		StartedAt: time.Now().UnixMilli(), Status: StatusRinging,
 	})
 	host := r.Host
@@ -795,44 +795,6 @@ func normalizePhone(p string) string {
 	return b.String()
 }
 
-func (s *server) handleGetAgentConfig(w http.ResponseWriter, r *http.Request) {
-	if s.agentConfig == nil {
-		writeJSON(w, http.StatusOK, map[string]any{"enabled": false, "hasKey": false})
-		return
-	}
-	writeJSON(w, http.StatusOK, s.agentConfig.Get())
-}
-
-func (s *server) handleUpdateAgentConfig(w http.ResponseWriter, r *http.Request) {
-	if s.agentConfig == nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "agent config unavailable"})
-		return
-	}
-	var body struct {
-		Enabled           *bool   `json:"enabled"`
-		AutoAnswer        *bool   `json:"autoAnswer"`
-		OpenRouterKey     *string `json:"openRouterKey"`
-		Model             *string `json:"model"`
-		SystemPrompt      *string `json:"systemPrompt"`
-		Voice             *string `json:"voice"`
-		AzureSpeechKey    *string `json:"azureSpeechKey"`
-		AzureSpeechRegion *string `json:"azureSpeechRegion"`
-		GoogleCloudKey    *string `json:"googleCloudKey"`
-		HfToken           *string `json:"hfToken"`
-		CustomTtsURL      *string `json:"customTtsUrl"`
-		CustomTtsKey      *string `json:"customTtsKey"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
-		return
-	}
-	s.agentConfig.Update(body.Enabled, body.AutoAnswer, body.OpenRouterKey, body.Model, body.SystemPrompt, body.Voice, body.AzureSpeechKey, body.AzureSpeechRegion, body.GoogleCloudKey, body.HfToken, body.CustomTtsURL, body.CustomTtsKey)
-	s.broker.broadcast(map[string]any{
-		"type":   "agent-config",
-		"config": s.agentConfig.Get(),
-	})
-	writeJSON(w, http.StatusOK, s.agentConfig.Get())
-}
 
 func (s *server) handleToggleCallAgent(w http.ResponseWriter, r *http.Request) {
 	sid := r.PathValue("sid")

@@ -7,33 +7,33 @@ import (
 
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	waLog "go.mau.fi/whatsmeow/util/log"
-	_ "modernc.org/sqlite"
+	_ "github.com/lib/pq"
 )
 
 type server struct {
 	broker      *Broker
 	sessions    *SessionManager
-	agentConfig *AgentConfig
+
 	log         *slog.Logger
 	staticDir   string
 }
 
-func openDB(dbPath string) (*sql.DB, error) {
-	dsn := "file:" + dbPath + "?_pragma=foreign_keys(1)&_pragma=busy_timeout(10000)&_pragma=journal_mode(WAL)"
-	db, err := sql.Open("sqlite", dsn)
+func openDB(dsn string) (*sql.DB, error) {
+	db, err := sql.Open("postgres", dsn)
 	if err != nil {
 		return nil, err
 	}
-	db.SetMaxOpenConns(1)
+	db.SetMaxOpenConns(50)
+	db.SetMaxIdleConns(10)
 	return db, nil
 }
 
-func newServer(ctx context.Context, dbPath, staticDir string, maxCalls int, agentCfg *AgentConfig, log *slog.Logger) (*server, error) {
+func newServer(ctx context.Context, dbPath, staticDir string, maxCalls int, log *slog.Logger) (*server, error) {
 	db, err := openDB(dbPath)
 	if err != nil {
 		return nil, err
 	}
-	container := sqlstore.NewWithDB(db, "sqlite3", waLog.Noop)
+	container := sqlstore.NewWithDB(db, "postgres", waLog.Noop)
 	if err := container.Upgrade(ctx); err != nil {
 		return nil, err
 	}
@@ -49,8 +49,10 @@ func newServer(ctx context.Context, dbPath, staticDir string, maxCalls int, agen
 
 	broker := NewBroker()
 	broker.setStore(store)
-	mgr := newSessionManager(ctx, container, broker, store, waLogger, log, maxCalls, agentCfg)
+	mgr := newSessionManager(ctx, container, broker, store, waLogger, log, maxCalls)
 	broker.SnapshotFn = mgr.snapshotEvents
 
-	return &server{broker: broker, sessions: mgr, agentConfig: agentCfg, log: log, staticDir: staticDir}, nil
+	startScheduler(ctx, db, mgr, log)
+
+	return &server{broker: broker, sessions: mgr, log: log, staticDir: staticDir}, nil
 }

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -34,10 +35,7 @@ func (s *Session) GenerateAndSendLeadDossier(callID string, peerJID types.JID, t
 		return
 	}
 
-	apiKey := ""
-	if s.mgr.agentConfig != nil {
-		apiKey = s.mgr.agentConfig.RawKey()
-	}
+	apiKey := os.Getenv("GEMINI_API_KEY")
 	if apiKey == "" {
 		return
 	}

@@ -20,14 +20,13 @@ type SessionManager struct {
 	waLogger    waLog.Logger
 	log         *slog.Logger
 	maxCalls    int
-	agentConfig *AgentConfig
 
 	mu       sync.RWMutex
 	sessions map[string]*Session
 	order    []string
 }
 
-func newSessionManager(ctx context.Context, container *sqlstore.Container, broker *Broker, store *sessionStore, waLogger waLog.Logger, log *slog.Logger, maxCalls int, agentCfg *AgentConfig) *SessionManager {
+func newSessionManager(ctx context.Context, container *sqlstore.Container, broker *Broker, store *sessionStore, waLogger waLog.Logger, log *slog.Logger, maxCalls int) *SessionManager {
 	return &SessionManager{
 		appCtx:      ctx,
 		container:   container,
@@ -36,7 +35,6 @@ func newSessionManager(ctx context.Context, container *sqlstore.Container, broke
 		waLogger:    waLogger,
 		log:         log,
 		maxCalls:    maxCalls,
-		agentConfig: agentCfg,
 		sessions:    map[string]*Session{},
 	}
 }
@@ -95,9 +93,7 @@ func (m *SessionManager) allSessions() []*Session {
 
 func (m *SessionManager) snapshotEvents() []any {
 	events := []any{map[string]any{"type": "session-list", "sessions": m.infos()}}
-	if m.agentConfig != nil {
-		events = append(events, map[string]any{"type": "agent-config", "config": m.agentConfig.Get()})
-	}
+
 	return events
 }
 
@@ -124,7 +120,7 @@ func (m *SessionManager) Restore(ctx context.Context) error {
 			continue
 		}
 		client := whatsmeow.NewClient(device, m.waLogger)
-		s := newSession(m, row.ID, row.Name, client)
+		s := newSession(m, row.ID, row.BusinessID, client)
 		m.register(s)
 		if err := s.connect(ctx); err != nil {
 			m.log.Error("session connect failed", "session", row.ID, "err", err)
@@ -135,21 +131,21 @@ func (m *SessionManager) Restore(ctx context.Context) error {
 	return nil
 }
 
-func (m *SessionManager) Create(name string) (string, error) {
+func (m *SessionManager) Create(businessID string) (string, error) {
 	id := newSessionID()
-	if err := m.store.insert(m.appCtx, id, name); err != nil {
+	if err := m.store.insert(m.appCtx, id, businessID); err != nil {
 		return "", err
 	}
 	device := m.container.NewDevice()
 	client := whatsmeow.NewClient(device, m.waLogger)
-	s := newSession(m, id, name, client)
+	s := newSession(m, id, businessID, client)
 	m.register(s)
 	m.broker.emitSessionList(m.infos())
 	if err := s.startPairing(m.appCtx); err != nil {
 		m.log.Error("start pairing failed", "session", id, "err", err)
 		return "", fmt.Errorf("start pairing: %w", err)
 	}
-	m.log.Info("session created", "session", id, "name", name)
+	m.log.Info("session created", "session", id, "businessID", businessID)
 	return id, nil
 }
 

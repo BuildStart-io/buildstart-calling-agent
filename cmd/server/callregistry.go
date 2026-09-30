@@ -18,6 +18,8 @@ type activeCall struct {
 	audioListenersMu  sync.Mutex
 	audioListeners    map[int]func([]float32)
 	nextListenerID    int
+	greetingMessage   string
+	fallbackMessage   string
 }
 
 func (ac *activeCall) PushAudio(pcm []float32) {
