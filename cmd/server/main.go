@@ -53,7 +53,11 @@ func main() {
 	loadEnvFile(".env")
 
 	addr := flag.String("addr", ":8080", "HTTP listen address")
-	dbPath := flag.String("db", "wacalls.db", "SQLite session database path")
+	defaultDB := os.Getenv("DATABASE_URL")
+	if defaultDB == "" {
+		defaultDB = "postgres://postgres:2jAm38abeNBLA27HbGeP@178.104.127.220:5432/postgres?search_path=whatsapp_infra&sslmode=disable"
+	}
+	dbPath := flag.String("db", defaultDB, "PostgreSQL connection string")
 	staticDir := flag.String("static", "client/dist", "static client directory (optional)")
 	debug := flag.Bool("debug", false, "verbose logging")
 	maxCalls := flag.Int("max-calls-per-session", 8, "max concurrent calls per session (0 = unlimited)")
@@ -133,9 +137,7 @@ If they want to reach out themselves: wa.me/94713450815 or +94 71 136 5928 — s
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	agentCfg := newAgentConfig(*openRouterKey, *aiModel, *aiPrompt, *aiVoice, *aiAutoAnswer, *aiEnabled)
-
-	srv, err := newServer(ctx, *dbPath, *staticDir, *maxCalls, agentCfg, log)
+	srv, err := newServer(ctx, *dbPath, *staticDir, *maxCalls, log)
 	if err != nil {
 		log.Error("startup failed", "err", err)
 		os.Exit(1)

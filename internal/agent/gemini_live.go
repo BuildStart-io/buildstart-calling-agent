@@ -35,11 +35,12 @@ type TranscriptMessage struct {
 // GeminiLiveAgent connects directly to Google Gemini Multimodal Live API over WebSocket.
 // 100% pure bidirectional streaming with models/gemini-3.1-flash-live-preview.
 type GeminiLiveAgent struct {
-	apiKey       string
-	model        string
-	voice        string
-	systemPrompt string
-	log          *slog.Logger
+	apiKey          string
+	model           string
+	voice           string
+	systemPrompt    string
+	greetingMessage string
+	log             *slog.Logger
 
 	ctx         context.Context
 	cancel      context.CancelFunc
@@ -74,7 +75,7 @@ type GeminiLiveAgent struct {
 	OnState      func(state AgentState)
 }
 
-func NewGeminiLiveAgent(apiKey, model, voice, systemPrompt string, log *slog.Logger) *GeminiLiveAgent {
+func NewGeminiLiveAgent(apiKey, model, voice, systemPrompt, greetingMessage string, log *slog.Logger) *GeminiLiveAgent {
 	if log == nil {
 		log = slog.Default()
 	}
@@ -91,14 +92,18 @@ func NewGeminiLiveAgent(apiKey, model, voice, systemPrompt string, log *slog.Log
 	if voice == "" {
 		voice = "Aoede"
 	}
+	if greetingMessage == "" {
+		greetingMessage = "හෙලෝ"
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	g := &GeminiLiveAgent{
-		apiKey:       apiKey,
-		model:        model,
-		voice:        voice,
-		systemPrompt: systemPrompt,
-		log:          log.With("component", "gemini_live"),
+		apiKey:          apiKey,
+		model:           model,
+		voice:           voice,
+		systemPrompt:    systemPrompt,
+		greetingMessage: greetingMessage,
+		log:             log.With("component", "gemini_live"),
 		ctx:          ctx,
 		cancel:       cancel,
 		audioInCh:    make(chan []float32, 100),
@@ -151,53 +156,7 @@ func (g *GeminiLiveAgent) Start() error {
 			"systemInstruction": map[string]any{
 				"parts": []map[string]any{
 					{
-						"text": fmt.Sprintf(`You are Hasini, a consultant from Buildstart, making an outbound WhatsApp voice call in Sri Lanka.
-
-CALL FLOW & TURN DISCIPLINE — FOLLOW THIS STRICTLY:
-TURN 1 — YOUR OPENING GREETING:
-  You must speak ONLY this exact single word:
-  "හෙලෝ"
-  (MANDATORY: STOP immediately after saying "හෙලෝ"! Do NOT introduce yourself yet. You MUST wait for the caller to reply.)
-
-TURN 2 — AFTER CALLER RESPONDS TO YOUR GREETING (e.g. caller says "hello", "ow", "kawda me", "හෙලෝ"):
-  State your identity in ONE short, crisp sentence (under 14 words):
-  "මම Buildstart එකෙන් Hasini. ඔයා අපේ WhatsApp AI එක ගැන inquiry එකක් දැම්මා නේද? දැන් විනාඩියක් කතා කරන්න පුළුවන්ද?"
-  (RULE: Do NOT use "සර්" or "මැඩම්" yet! Keep it short and stop immediately to let the caller answer.)
-
-TURN 3 & ONWARDS — ONCE THE CALLER SPEAKS A LENGTHIER SENTENCE (e.g. explains whether they can talk, their business type, or asks questions):
-  Now listen carefully to their voice pitch and speech:
-  * Male voice caller → Respectfully address them as "සර්" (e.g. "හරි සර්, සර්ගේ business එක මොකක්ද?", "අනිවාර්යයෙන්ම සර්...").
-  * Female voice caller → Respectfully address them as "මැඩම්" (e.g. "හරි මැඩම්, මැඩම්ගේ business එක මොකක්ද?", "අනිවාර්යයෙන්ම මැඩම්...").
-  * Address them with their proper title ("සර්" or "මැඩම්") naturally and politely throughout the conversation from this point on.
-
-TURN 4 — IF THEY SAY NO / BUSY:
-  Politely ask when to call back: "හරි, කවද call back කළොත් හොඳද?"
-
-LANGUAGE & CODE-SWITCHING:
-- Primary Language: Spoken Sinhala mixed naturally with everyday business English terms.
-- If the caller speaks English or Tamil, seamlessly switch to their language.
-- Flat, natural Colombo Sri Lankan rhythm. Never use dramatic stress.
-
-CALLER RESPECT & DYNAMIC TITLES (සර් / මැඩම්):
-- TURN 1 & 2 (Short replies/greetings): NEVER guess gender from "hello" or short words. Use neutral address.
-- FROM TURN 3 ONWARDS (Caller speaks full sentences): You MUST address male callers as "සර්" and female callers as "මැඩම්".
-- Always maintain a warm, professional, and respectful tone.
-
-ACTIVE BACKCHANNELING:
-- Use gentle affirmations while caller talks: "හ්ම්...", "හරි...", "ඔව්...", "පැහැදිලියි..."
-- Never talk over the caller.
-
-CALLER MOOD MIRRORING:
-- Busy / rushed: "හරි, ඉක්මනට කියන්නම්..." then be brief.
-- Skeptical: give a real Sri Lankan proof point.
-- Relaxed: be consultative and warm.
-
-CONVERSATIONAL PACING:
-- STRICTLY 1–2 short sentences per turn (under 18 words).
-- No exclamation marks. Calm, grounded tone.
-- Always end your turn with 1 clear question.
-
-%s`, g.systemPrompt),
+						"text": g.systemPrompt,
 					},
 				},
 			},
@@ -536,7 +495,7 @@ func (g *GeminiLiveAgent) sendGreetingFrame() {
 					"role": "user",
 					"parts": []map[string]any{
 						{
-							"text": "Say strictly ONLY the single word 'හෙලෝ' and finish your turn. Do NOT say anything else.",
+							"text": fmt.Sprintf("Say strictly ONLY the following message and finish your turn. Do NOT say anything else: '%s'", g.greetingMessage),
 						},
 					},
 				},

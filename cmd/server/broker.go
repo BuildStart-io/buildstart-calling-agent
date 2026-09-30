@@ -34,6 +34,7 @@ type CallTranscriptItem struct {
 
 type CallRecord struct {
 	SessionID       string               `json:"sessionId"`
+	BusinessID      string               `json:"businessId"`
 	CallID          string               `json:"callId"`
 	Owner           *string              `json:"owner"`
 	Direction       string               `json:"direction"` // "inbound", "outbound", "auto-callback"
@@ -85,9 +86,9 @@ type AuthSnapshot struct {
 }
 
 type SessionInfo struct {
-	ID     string `json:"id"`
-	Name   string `json:"name"`
-	JID    string `json:"jid"`
+	ID         string `json:"id"`
+	BusinessID string `json:"business_id"`
+	JID        string `json:"jid"`
 	State  string `json:"state"`
 	Paired bool   `json:"paired"`
 }
@@ -187,7 +188,7 @@ func (b *Broker) recordCallEvent(callID, eventType, message, details string) {
 	if ok && c != nil {
 		c.Events = append(c.Events, ev)
 		if b.store != nil {
-			go b.store.saveCallRecord(context.Background(), *c)
+			go b.store.saveCallRecord(context.Background(), *c, c.BusinessID)
 		}
 	}
 	b.mu.Unlock()
@@ -207,7 +208,7 @@ func (b *Broker) setCallOutcome(callID, outcome, summary string) {
 			c.Summary = summary
 		}
 		if b.store != nil {
-			go b.store.saveCallRecord(context.Background(), *c)
+			go b.store.saveCallRecord(context.Background(), *c, c.BusinessID)
 		}
 	}
 	b.mu.Unlock()
@@ -247,7 +248,7 @@ func (b *Broker) upsertCall(r CallRecord) {
 	cp := r
 	b.calls[r.CallID] = &cp
 	if b.store != nil {
-		go b.store.saveCallRecord(context.Background(), cp)
+		go b.store.saveCallRecord(context.Background(), cp, cp.BusinessID)
 	}
 	b.mu.Unlock()
 	b.broadcastCallList()
@@ -326,7 +327,7 @@ func (b *Broker) endCall(id, reason string) {
 	delete(b.calls, id)
 	b.history = append(b.history, ended)
 	if b.store != nil {
-		go b.store.saveCallRecord(context.Background(), ended)
+		go b.store.saveCallRecord(context.Background(), ended, ended.BusinessID)
 	}
 	owner := c.Owner
 	sessionID := c.SessionID
@@ -378,7 +379,7 @@ func (b *Broker) emitAgentTranscript(sessionID, callID, role, text string, ts in
 			Message:   fmt.Sprintf("[%s]: %s", role, text),
 		})
 		if b.store != nil {
-			go b.store.saveCallRecord(context.Background(), *c)
+			go b.store.saveCallRecord(context.Background(), *c, c.BusinessID)
 		}
 	}
 	b.mu.Unlock()

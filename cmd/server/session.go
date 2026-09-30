@@ -25,10 +25,10 @@ import (
 )
 
 type Session struct {
-	id   string
-	name string
-	mgr  *SessionManager
-	log  *slog.Logger
+	id         string
+	businessID string
+	mgr        *SessionManager
+	log        *slog.Logger
 
 	client *whatsmeow.Client
 	reg    *callRegistry
@@ -40,10 +40,10 @@ type Session struct {
 	lastCallbacks  map[string]time.Time
 }
 
-func newSession(mgr *SessionManager, id, name string, client *whatsmeow.Client) *Session {
+func newSession(mgr *SessionManager, id, businessID string, client *whatsmeow.Client) *Session {
 	s := &Session{
 		id:            id,
-		name:          name,
+		businessID:    businessID,
 		mgr:           mgr,
 		log:           mgr.log.With("session", id),
 		client:        client,
@@ -61,37 +61,48 @@ func (s *Session) createCall(callID string) *call.CallManager {
 		cm: cm,
 	}
 
-	if cfg := s.mgr.agentConfig; cfg != nil && cfg.IsEnabled() {
-		rawKey := cfg.RawKey()
-		if rawKey != "" {
-			voice := cfg.CurrentVoice()
-			if voice == "" || strings.HasPrefix(voice, "dialog-") || strings.HasPrefix(voice, "piper-") || voice == "Kore" {
-				voice = "Aoede"
-			}
-			model := cfg.CurrentModel()
-			if model == "" {
-				model = "models/gemini-3.1-flash-live-preview"
-			}
-			if strings.HasPrefix(model, "google/") {
-				model = strings.TrimPrefix(model, "google/")
-			}
-			if !strings.HasPrefix(model, "models/") {
-				model = "models/" + model
-			}
-			prompt := cfg.CurrentPrompt()
-
-			gl := agent.NewGeminiLiveAgent(rawKey, model, voice, prompt, s.log.With("call_id", callID))
-			gl.FeedAudio = func(pcm []float32) {
-				ac.PushAudio(pcm)
-			}
-			gl.OnInterrupt = func() {
-				ac.cm.FlushCapturedPCM()
-			}
-			gl.OnTranscript = func(msg agent.TranscriptMessage) {
-				s.mgr.broker.emitAgentTranscript(s.id, callID, msg.Role, msg.Text, msg.Timestamp)
-			}
-			ac.geminiLive = gl
+	cfg, err := s.mgr.store.getAgentConfig(context.Background(), s.businessID)
+	if err != nil {
+		s.log.Error("failed to load agent config, falling back to disabled", "err", err)
+	} else if os.Getenv("GEMINI_API_KEY") != "" {
+		rawKey := os.Getenv("GEMINI_API_KEY")
+		voice := cfg.VoiceModel
+		if voice == "" || strings.HasPrefix(voice, "dialog-") || strings.HasPrefix(voice, "piper-") || voice == "Kore" {
+			voice = "Aoede"
 		}
+		model := "models/gemini-3.1-flash-live-preview"
+		
+		basePrompt := `You are a trusted voice sales consultant in Sri Lanka — calm, warm, confident, and genuinely helpful. You are not an FAQ bot, but you never sound pushy, overexcited, theatrical, or aggressive. Guide the call naturally, understand the customer, recommend the right fit, and agree on a useful next step.
+
+VOICE AND DELIVERY
+Speak at a relaxed, steady pace with a friendly Sri Lankan tone. Use moderate energy and restrained enthusiasm. Keep your pitch and volume even. Do not shout, rush, exaggerate, use hype, or sound like a scripted salesperson. Pause naturally, listen carefully, and acknowledge the customer's answer before asking the next question.
+
+LANGUAGE
+Speak natural Sinhala, Tamil, English, or authentic Singlish and Tanglish code-switching, matching the customer. If they mix languages, mix back naturally. If you did not hear clearly, ask them to repeat — never guess.
+
+HARD RULES
+1. Usually end with one relevant open question or a gentle two-option choice, but do not interrogate.
+2. Keep each spoken sentence under about 20 words and use 1–2 sentences per turn. Use natural connectors sparingly: "හරි", "ඇත්තටම", "නේද?", "சரி".
+3. Never dump feature lists. Give one relevant benefit, then ask.
+
+BUSINESS KNOWLEDGE (STRICTLY ADHERE TO THIS):
+`
+		fullPrompt := basePrompt + cfg.BusinessPrompt
+
+		gl := agent.NewGeminiLiveAgent(rawKey, model, voice, fullPrompt, cfg.GreetingMessage, s.log.With("call_id", callID))
+		gl.FeedAudio = func(pcm []float32) {
+			ac.PushAudio(pcm)
+		}
+		gl.OnInterrupt = func() {
+			ac.cm.FlushCapturedPCM()
+		}
+		gl.OnTranscript = func(msg agent.TranscriptMessage) {
+			s.mgr.broker.emitAgentTranscript(s.id, callID, msg.Role, msg.Text, msg.Timestamp)
+		}
+		
+		ac.greetingMessage = cfg.GreetingMessage
+		ac.fallbackMessage = cfg.FallbackMessage
+		ac.geminiLive = gl
 	}
 
 	s.wireCall(cm, callID)
@@ -104,7 +115,7 @@ func (s *Session) wireCall(cm *call.CallManager, callID string) {
 		peerNum := s.mgr.store.resolvePhone(c.PeerJid)
 		now := time.Now().UnixMilli()
 		s.mgr.broker.upsertCall(CallRecord{
-			SessionID: s.id, CallID: c.CallID, Direction: "inbound", Peer: c.PeerJid, PeerNumber: peerNum,
+			SessionID: s.id, BusinessID: s.businessID, CallID: c.CallID, Direction: "inbound", Peer: c.PeerJid, PeerNumber: peerNum,
 			StartedAt: now, Status: StatusRinging, Outcome: "Incoming Call",
 			Events: []CallEventLog{{
 				Timestamp: now,
@@ -164,9 +175,11 @@ func (s *Session) wireCall(cm *call.CallManager, callID string) {
 		var hadConversation bool
 		var peerAudioReceived bool
 		var callbackJID types.JID
+		var fallbackMsg string
 		if ac, ok := s.reg.get(c.CallID); ok {
 			callbackJID = ac.callbackJID
 			peerAudioReceived = ac.peerAudioReceived
+			fallbackMsg = ac.fallbackMessage
 			if ac.geminiLive != nil {
 				hadConversation = ac.geminiLive.HasSpokenWithPeer()
 				ac.geminiLive.Close()
@@ -212,8 +225,8 @@ func (s *Session) wireCall(cm *call.CallManager, callID string) {
 
 				// 1. Send immediate WhatsApp text notification to caller
 				msgText := "ආයුබෝවන්! ඔබ අප අමතන්නට උත්සාහ කළ බව දුටුවෙමි. අපගේ AI හඬ සහායකයා මේ මොහොතේම ඔබව නැවත අමතනු ඇත."
-				if s.mgr.agentConfig != nil && strings.HasPrefix(s.mgr.agentConfig.CurrentVoice(), "en-") {
-					msgText = "Hello! We saw that you just tried to call. Our AI voice assistant will call you back right away."
+				if fallbackMsg != "" {
+					msgText = fallbackMsg
 				}
 				s.sendWhatsAppMessage(dialJID, msgText)
 
@@ -272,7 +285,7 @@ func (s *Session) startOutgoingWithGreeting(ctx context.Context, peer types.JID,
 	peerNum := s.mgr.store.resolvePhone(peer.User)
 	now := time.Now().UnixMilli()
 	s.mgr.broker.upsertCall(CallRecord{
-		SessionID: s.id, CallID: callID, Direction: dir, Peer: peer.String(), PeerNumber: peerNum,
+		SessionID: s.id, BusinessID: s.businessID, CallID: callID, Direction: dir, Peer: peer.String(), PeerNumber: peerNum,
 		StartedAt: now, Status: StatusStarting, TriggerReason: trigger, Outcome: outcome,
 		Events: []CallEventLog{{
 			Timestamp: now,
@@ -366,7 +379,7 @@ func (s *Session) onIncomingOffer(ctx context.Context, evt *events.CallOffer) {
 	s.mgr.broker.recordCallEvent(callID, "offer_received", "Inbound WhatsApp call offer received from "+peerNum, fmt.Sprintf("From: %s", evt.From.String()))
 	cm.HandleCallOffer(ctx, node, evt.From)
 
-	if s.mgr.agentConfig != nil && s.mgr.agentConfig.IsAutoAnswer() {
+	if true { // Always auto-answer
 		s.log.Info("auto-answering incoming WhatsApp call after 1.2s ring", "call_id", callID)
 		go func() {
 			if ac, ok := s.reg.get(callID); ok {
@@ -488,9 +501,6 @@ func (s *Session) handleIncomingMessage(evt *events.Message) {
 }
 
 func (s *Session) scheduleAutoCallback(peer types.JID, reason string) {
-	if s.mgr.agentConfig == nil || !s.mgr.agentConfig.IsEnabled() {
-		return
-	}
 	if peer.IsEmpty() {
 		return
 	}
@@ -515,6 +525,19 @@ func (s *Session) scheduleAutoCallback(peer types.JID, reason string) {
 
 	s.log.Info("scheduling instant AI auto-callback", "peer", peerStr, "reason", reason)
 	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+		defer cancel()
+
+		agentCfg, err := s.mgr.store.getAgentConfig(ctx, s.businessID)
+		if err != nil {
+			s.log.Error("failed to get agent config for auto-callback", "business_id", s.businessID, "err", err)
+			return
+		}
+
+		if agentCfg.FallbackMessage != "" {
+			s.sendWhatsAppMessage(peer, agentCfg.FallbackMessage)
+		}
+
 		// Wait 4.0s so the caller's phone returns to idle state from the previous attempt
 		time.Sleep(4000 * time.Millisecond)
 
@@ -529,11 +552,8 @@ func (s *Session) scheduleAutoCallback(peer types.JID, reason string) {
 			}
 		}
 
-		ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
-		defer cancel()
-
 		callbackGreeting := "ආයුබෝවන්! ඔබ මීට සුළු මොහොතකට පෙර අප අමතන්නට උත්සාහ කළ බව දුටුවෙමි. මම ඔබගේ AI හඬ සහායකයා. ඔබට අද මම කොහොමද උදවු කරන්නේ?"
-		if strings.HasPrefix(s.mgr.agentConfig.CurrentVoice(), "en-") {
+		if strings.HasPrefix(agentCfg.VoiceModel, "en-") {
 			callbackGreeting = "Hello! I saw that you just tried calling our WhatsApp line. I am your AI voice assistant. How can I help you today?"
 		}
 
@@ -598,7 +618,7 @@ func (s *Session) info() SessionInfo {
 	if id := s.client.Store.ID; id != nil {
 		jid = id.String()
 	}
-	return SessionInfo{ID: s.id, Name: s.name, JID: jid, State: a.State, Paired: a.Paired || jid != ""}
+	return SessionInfo{ID: s.id, BusinessID: s.businessID, JID: jid, State: a.State, Paired: a.Paired || jid != ""}
 }
 
 func (s *Session) setBridge(callID string, b *Bridge) {
