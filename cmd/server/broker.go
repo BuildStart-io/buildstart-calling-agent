@@ -157,8 +157,14 @@ func (b *Broker) broadcast(ev any) {
 }
 
 func (b *Broker) emitAuthState(sessionID string, a AuthSnapshot) {
+	// New format
 	b.broadcast(map[string]any{
 		"type": "auth-state", "sessionId": sessionID,
+		"paired": a.Paired, "state": a.State, "qr": a.QR,
+	})
+	// Backward compatible format
+	b.broadcast(map[string]any{
+		"type": "state", "sessionId": sessionID,
 		"paired": a.Paired, "state": a.State, "qr": a.QR,
 	})
 }
@@ -168,7 +174,10 @@ func (b *Broker) emitSessionList(sessions []SessionInfo) {
 }
 
 func (b *Broker) emitSessionQR(sessionID, qr string) {
+	// New format
 	b.broadcast(map[string]any{"type": "session-qr", "sessionId": sessionID, "qr": qr})
+	// Backward compatible format
+	b.broadcast(map[string]any{"type": "qr", "sessionId": sessionID, "qr": qr})
 }
 
 func (b *Broker) recordCallEvent(callID, eventType, message, details string) {
