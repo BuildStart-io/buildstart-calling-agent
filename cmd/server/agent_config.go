@@ -2,7 +2,6 @@ package main
 
 import (
 	"sync"
-	"wacalls/internal/agent"
 )
 
 type AgentConfig struct {
@@ -23,10 +22,10 @@ type AgentConfig struct {
 
 func newAgentConfig(openRouterKey, model, systemPrompt, voice string, autoAnswer, enabled bool) *AgentConfig {
 	if model == "" {
-		model = agent.DefaultOpenRouterModel
+		model = "models/gemini-3.1-flash-live-preview"
 	}
 	if systemPrompt == "" {
-		systemPrompt = agent.DefaultSystemPrompt
+		systemPrompt = "You are a helpful AI assistant." // Will be overridden dynamically per session
 	}
 	if voice == "" {
 		voice = "dialog-nipunika"

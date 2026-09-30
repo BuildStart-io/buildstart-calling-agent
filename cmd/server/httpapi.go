@@ -456,8 +456,8 @@ func (s *server) handleDirectAudioWS(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Silences any local AI agent so only Lovable handles audio
-	if ac.agent != nil {
-		ac.agent.SetEnabled(false)
+	if ac.geminiLive != nil {
+		ac.geminiLive.SetEnabled(false)
 	}
 
 	rate := 16000
@@ -713,8 +713,8 @@ func (s *server) doWebRTC(sess *Session, w http.ResponseWriter, r *http.Request)
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "no such call"})
 		return
 	}
-	if ac.agent != nil {
-		ac.agent.SetEnabled(false)
+	if ac.geminiLive != nil {
+		ac.geminiLive.SetEnabled(false)
 	}
 	var body struct {
 		SDPOffer string `json:"sdp_offer"`
@@ -850,8 +850,8 @@ func (s *server) handleToggleCallAgent(w http.ResponseWriter, r *http.Request) {
 		Enabled bool `json:"enabled"`
 	}
 	_ = json.NewDecoder(r.Body).Decode(&body)
-	if ac.agent != nil {
-		ac.agent.SetEnabled(body.Enabled)
+	if ac.geminiLive != nil {
+		ac.geminiLive.SetEnabled(body.Enabled)
 		s.broker.emitAgentStatus(sid, cid, body.Enabled, "idle")
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"callId": cid, "agentEnabled": body.Enabled})

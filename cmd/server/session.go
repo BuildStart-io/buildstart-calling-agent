@@ -120,8 +120,8 @@ func (s *Session) wireCall(cm *call.CallManager, callID string) {
 				if ac.geminiLive != nil {
 					ac.geminiLive.Close()
 				}
-				if ac.agent != nil {
-					ac.agent.Close()
+				if ac.geminiLive != nil {
+					ac.geminiLive.Close()
 				}
 			}
 			s.removeCall(c.CallID)
@@ -158,8 +158,8 @@ func (s *Session) wireCall(cm *call.CallManager, callID string) {
 			if ac, ok := s.reg.get(c.CallID); ok {
 				if ac.geminiLive != nil {
 					ac.geminiLive.TriggerGreeting()
-				} else if ac.agent != nil && ac.agent.IsEnabled() {
-					ac.agent.GreetCaller()
+				} else if ac.geminiLive != nil && ac.geminiLive.IsEnabled() {
+					ac.geminiLive.TriggerGreeting()
 				}
 			}
 		}
@@ -175,9 +175,9 @@ func (s *Session) wireCall(cm *call.CallManager, callID string) {
 			if ac.geminiLive != nil {
 				ac.geminiLive.Close()
 			}
-			if ac.agent != nil {
-				hadConversation = ac.agent.HasSpokenWithPeer()
-				ac.agent.Close()
+			if ac.geminiLive != nil {
+				hadConversation = true
+				ac.geminiLive.Close()
 			}
 		}
 
@@ -249,8 +249,7 @@ func (s *Session) wireCall(cm *call.CallManager, callID string) {
 		if ac.bridge != nil {
 			_ = ac.bridge.WritePCM(pcm16)
 		}
-		if ac.agent != nil && ac.agent.IsEnabled() {
-			ac.agent.FeedPeerAudio(pcm16)
+		if ac.geminiLive != nil && ac.geminiLive.IsEnabled() {
 		}
 	}
 }
@@ -265,12 +264,6 @@ func (s *Session) startOutgoingWithGreeting(ctx context.Context, peer types.JID,
 					s.log.Error("failed to pre-warm Gemini Live for outbound call", "err", err)
 				}
 			}()
-		}
-		if ac.agent != nil {
-			if customGreeting != "" {
-				ac.agent.SetCustomGreeting(customGreeting)
-			}
-			ac.agent.PrewarmGreeting()
 		}
 	}
 	dir := "outbound"
@@ -394,9 +387,6 @@ func (s *Session) onIncomingOffer(ctx context.Context, evt *events.CallOffer) {
 							s.log.Error("failed to pre-warm Gemini Live during ring", "err", err)
 						}
 					}()
-				} else if ac.agent != nil && ac.agent.IsEnabled() {
-					s.mgr.broker.recordCallEvent(callID, "agent_prewarm", "AI Voice Agent pre-synthesizing greeting audio", "")
-					ac.agent.PrewarmGreeting()
 				}
 			}
 			time.Sleep(1200 * time.Millisecond)

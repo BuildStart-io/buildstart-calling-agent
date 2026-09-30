@@ -17,6 +17,21 @@ import (
 	"github.com/coder/websocket"
 )
 
+type AgentState string
+
+const (
+	StateIdle      AgentState = "idle"
+	StateListening AgentState = "listening"
+	StateThinking  AgentState = "thinking"
+	StateSpeaking  AgentState = "speaking"
+)
+
+type TranscriptMessage struct {
+	Role      string `json:"role"` // "user" or "assistant" or "system"
+	Text      string `json:"text"`
+	Timestamp int64  `json:"timestamp"`
+}
+
 // GeminiLiveAgent connects directly to Google Gemini Multimodal Live API over WebSocket.
 // 100% pure bidirectional streaming with models/gemini-3.1-flash-live-preview.
 type GeminiLiveAgent struct {

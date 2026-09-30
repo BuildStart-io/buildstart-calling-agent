@@ -12,7 +12,6 @@ import (
 type activeCall struct {
 	cm                *call.CallManager
 	bridge            *Bridge
-	agent             *agent.AIAgent
 	geminiLive        *agent.GeminiLiveAgent
 	callbackJID       types.JID
 	peerAudioReceived bool
