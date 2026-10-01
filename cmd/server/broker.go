@@ -234,35 +234,34 @@ func (b *Broker) upsertCall(r CallRecord) {
 	if r.PeerNumber == "" && r.Peer != "" {
 		r.PeerNumber = formatPhoneNumber(r.Peer)
 	}
+
+	var callToSave CallRecord
 	existing, ok := b.calls[r.CallID]
 	if ok && existing != nil {
-		if len(r.Events) == 0 && len(existing.Events) > 0 {
-			r.Events = existing.Events
-		}
-		if len(r.Transcripts) == 0 && len(existing.Transcripts) > 0 {
-			r.Transcripts = existing.Transcripts
-		}
-		if r.PeerNumber == "" && existing.PeerNumber != "" {
-			r.PeerNumber = existing.PeerNumber
-		}
-		if r.Outcome == "" && existing.Outcome != "" {
-			r.Outcome = existing.Outcome
-		}
-		if r.TriggerReason == "" && existing.TriggerReason != "" {
-			r.TriggerReason = existing.TriggerReason
-		}
-		if r.ConnectedAt == nil && existing.ConnectedAt != nil {
-			r.ConnectedAt = existing.ConnectedAt
-		}
+		if r.Direction != "" { existing.Direction = r.Direction }
+		if r.Peer != "" { existing.Peer = r.Peer }
+		if r.PeerNumber != "" { existing.PeerNumber = r.PeerNumber }
+		if r.Status != "" { existing.Status = r.Status }
+		if r.ConnectedAt != nil { existing.ConnectedAt = r.ConnectedAt }
+		if r.EndedAt != nil { existing.EndedAt = r.EndedAt }
+		if r.DurationSeconds > 0 { existing.DurationSeconds = r.DurationSeconds }
+		if r.EndReason != "" { existing.EndReason = r.EndReason }
+		if r.Outcome != "" { existing.Outcome = r.Outcome }
+		if r.TriggerReason != "" { existing.TriggerReason = r.TriggerReason }
+		if r.Summary != "" { existing.Summary = r.Summary }
+		callToSave = *existing
+	} else {
+		cp := r
+		b.calls[r.CallID] = &cp
+		callToSave = cp
 	}
-	cp := r
-	b.calls[r.CallID] = &cp
+	
 	if b.store != nil {
-		go b.store.saveCallRecord(context.Background(), cp, cp.BusinessID)
+		go b.store.saveCallRecord(context.Background(), callToSave, callToSave.BusinessID)
 	}
 	b.mu.Unlock()
 	b.broadcastCallList()
-	streamURL := fmt.Sprintf("wss://buildstart-calling-agent.buildstart.io/api/v1/calls/%s/audio", r.CallID)
+	streamURL := fmt.Sprintf("wss://buildstart-calling-agent.buildstart.io/api/v1/calls/%s/audio", callToSave.CallID)
 	b.broadcast(map[string]any{
 		"type": "call-status", "sessionId": r.SessionID, "id": r.CallID, "callId": r.CallID, "call_id": r.CallID, "owner": r.Owner,
 		"status": r.Status, "peer": r.Peer, "peerNumber": r.PeerNumber, "direction": r.Direction,
