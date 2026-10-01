@@ -89,8 +89,9 @@ type SessionInfo struct {
 	ID         string `json:"id"`
 	BusinessID string `json:"business_id"`
 	JID        string `json:"jid"`
-	State  string `json:"state"`
-	Paired bool   `json:"paired"`
+	State      string `json:"state"`
+	Paired     bool   `json:"paired"`
+	QR         string `json:"qr,omitempty"`
 }
 
 type subscriber struct {
@@ -261,7 +262,7 @@ func (b *Broker) upsertCall(r CallRecord) {
 	}
 	b.mu.Unlock()
 	b.broadcastCallList()
-	streamURL := fmt.Sprintf("wss://wacaller.bandara.me/api/v1/calls/%s/audio", r.CallID)
+	streamURL := fmt.Sprintf("wss://buildstart-calling-agent.buildstart.io/api/v1/calls/%s/audio", r.CallID)
 	b.broadcast(map[string]any{
 		"type": "call-status", "sessionId": r.SessionID, "id": r.CallID, "callId": r.CallID, "call_id": r.CallID, "owner": r.Owner,
 		"status": r.Status, "peer": r.Peer, "peerNumber": r.PeerNumber, "direction": r.Direction,
@@ -362,7 +363,7 @@ func (b *Broker) broadcastCallList() {
 }
 
 func (b *Broker) emitIncoming(sessionID, id, peer string) {
-	streamURL := fmt.Sprintf("wss://wacaller.bandara.me/api/v1/calls/%s/audio", id)
+	streamURL := fmt.Sprintf("wss://buildstart-calling-agent.buildstart.io/api/v1/calls/%s/audio", id)
 	b.broadcast(map[string]any{
 		"type": "incoming", "sessionId": sessionID, "id": id, "callId": id, "call_id": id,
 		"peer": peer, "offeredAt": time.Now().UnixMilli(),
@@ -433,6 +434,8 @@ func (b *Broker) serveSSE(w http.ResponseWriter, r *http.Request, clientID strin
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("X-Accel-Buffering", "no")
+	flusher.Flush()
 
 	sub := b.subscribe(clientID)
 	defer b.unsubscribe(sub)

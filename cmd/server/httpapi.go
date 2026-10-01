@@ -120,7 +120,10 @@ func clientID(r *http.Request) string {
 	if id := r.Header.Get("X-Client-Id"); id != "" {
 		return id
 	}
-	return r.URL.Query().Get("clientId")
+	if id := r.URL.Query().Get("clientId"); id != "" {
+		return id
+	}
+	return r.URL.Query().Get("session_id")
 }
 
 func (s *server) defaultSession() *Session {
@@ -268,7 +271,7 @@ func (s *server) handleCallsList(w http.ResponseWriter, r *http.Request) {
 	var list []map[string]any
 	host := r.Host
 	if host == "" {
-		host = "wacaller.bandara.me"
+		host = "buildstart-calling-agent.buildstart.io"
 	}
 	for _, c := range s.broker.calls {
 		streamURL := fmt.Sprintf("wss://%s/api/v1/calls/%s/audio", host, c.CallID)
@@ -302,7 +305,7 @@ func (s *server) handleCallGet(w http.ResponseWriter, r *http.Request) {
 	}
 	host := r.Host
 	if host == "" {
-		host = "wacaller.bandara.me"
+		host = "buildstart-calling-agent.buildstart.io"
 	}
 	streamURL := fmt.Sprintf("wss://%s/api/v1/calls/%s/audio", host, c.CallID)
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -404,7 +407,7 @@ func (s *server) handleDirectDial(w http.ResponseWriter, r *http.Request) {
 
 	host := r.Host
 	if host == "" {
-		host = "wacaller.bandara.me"
+		host = "buildstart-calling-agent.buildstart.io"
 	}
 	streamURL := fmt.Sprintf("wss://%s/api/v1/calls/%s/audio", host, callID)
 
@@ -686,7 +689,7 @@ func (s *server) doStartCall(sess *Session, w http.ResponseWriter, r *http.Reque
 	})
 	host := r.Host
 	if host == "" {
-		host = "wacaller.bandara.me"
+		host = "buildstart-calling-agent.buildstart.io"
 	}
 	streamURL := fmt.Sprintf("wss://%s/api/v1/calls/%s/audio", host, callID)
 

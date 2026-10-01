@@ -618,7 +618,14 @@ func (s *Session) info() SessionInfo {
 	if id := s.client.Store.ID; id != nil {
 		jid = id.String()
 	}
-	return SessionInfo{ID: s.id, BusinessID: s.businessID, JID: jid, State: a.State, Paired: a.Paired || jid != ""}
+	return SessionInfo{
+		ID:         s.id,
+		BusinessID: s.businessID,
+		JID:        jid,
+		State:      a.State,
+		Paired:     a.Paired || jid != "",
+		QR:         a.QR,
+	}
 }
 
 func (s *Session) setBridge(callID string, b *Bridge) {
