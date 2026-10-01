@@ -67,7 +67,7 @@ func (s *Session) createCall(callID string) *call.CallManager {
 	} else if os.Getenv("GEMINI_API_KEY") != "" {
 		rawKey := os.Getenv("GEMINI_API_KEY")
 		voice := cfg.VoiceModel
-		if voice == "" || strings.HasPrefix(voice, "dialog-") || strings.HasPrefix(voice, "piper-") || voice == "Kore" {
+		if voice == "" || strings.HasPrefix(voice, "dialog-") || strings.HasPrefix(voice, "piper-") || strings.HasPrefix(voice, "models/") || voice == "Kore" {
 			voice = "Aoede"
 		}
 		model := "models/gemini-3.1-flash-live-preview"
