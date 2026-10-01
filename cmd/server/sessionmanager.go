@@ -92,8 +92,13 @@ func (m *SessionManager) allSessions() []*Session {
 }
 
 func (m *SessionManager) snapshotEvents() []any {
-	events := []any{map[string]any{"type": "session-list", "sessions": m.infos()}}
-
+	infos := m.infos()
+	events := []any{map[string]any{"type": "session-list", "sessions": infos}}
+	for _, info := range infos {
+		if info.QR != "" {
+			events = append(events, map[string]any{"type": "session-qr", "sessionId": info.ID, "session_id": info.ID, "qr": info.QR})
+		}
+	}
 	return events
 }
 
