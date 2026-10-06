@@ -157,7 +157,9 @@ func (m *SessionManager) Create(businessID string) (string, error) {
 func (m *SessionManager) Delete(ctx context.Context, id string) error {
 	s, ok := m.Get(id)
 	if !ok {
-		return fmt.Errorf("no session %s", id)
+		m.log.Warn("delete called for unknown session; cleaning up DB anyway", "session", id)
+		_ = m.store.delete(ctx, id)
+		return nil
 	}
 	if s.client.Store.ID != nil {
 		if err := s.client.Logout(ctx); err != nil {
