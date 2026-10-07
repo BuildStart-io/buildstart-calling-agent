@@ -347,17 +347,9 @@ func (g *GeminiLiveAgent) readLoop() {
 						}
 					} else {
 						g.prewarmMu.Lock()
-						// Cap pre-warmed greeting to max 1.2s (19,200 samples @ 16kHz)
-						// This guarantees Hasini ONLY speaks "හෙලෝ" and stops, waiting for caller
-						const maxGreetingSamples = 19200
-						if len(g.prewarmedGreeting) < maxGreetingSamples {
-							remaining := maxGreetingSamples - len(g.prewarmedGreeting)
-							if len(mastered) > remaining {
-								g.prewarmedGreeting = append(g.prewarmedGreeting, mastered[:remaining]...)
-							} else {
-								g.prewarmedGreeting = append(g.prewarmedGreeting, mastered...)
-							}
-						}
+						// Accumulate the entire pre-warmed greeting so custom
+						// multi-sentence greetings play fully upon pickup.
+						g.prewarmedGreeting = append(g.prewarmedGreeting, mastered...)
 						g.prewarmMu.Unlock()
 					}
 				}
