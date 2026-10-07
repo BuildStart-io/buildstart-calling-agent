@@ -26,6 +26,12 @@ const (
 	StateSpeaking  AgentState = "speaking"
 )
 
+// bargeInMinSpeechMs is how long the caller must speak continuously before Gemini
+// treats it as a real barge-in (sent to Gemini as automaticActivityDetection.prefixPaddingMs).
+// Raise it if backchannels ("mm", "okay") still cut the agent off; lower it if real
+// interruptions feel sluggish.
+const bargeInMinSpeechMs = 300
+
 type TranscriptMessage struct {
 	Role      string `json:"role"` // "user" or "assistant" or "system"
 	Text      string `json:"text"`
@@ -162,6 +168,17 @@ func (g *GeminiLiveAgent) Start() error {
 			},
 			"inputAudioTranscription":  map[string]any{},
 			"outputAudioTranscription": map[string]any{},
+			// Barge-in debounce: Gemini only commits start-of-speech (and therefore
+			// sends `interrupted`, which flushes the agent's buffered audio) after the
+			// caller has spoken continuously for bargeInMinSpeechMs. Short sounds such
+			// as "mm", "ah", breaths or background noise no longer cut the agent off
+			// mid-sentence. Silence/end-of-turn detection is left at Gemini defaults so
+			// response latency is unchanged.
+			"realtimeInputConfig": map[string]any{
+				"automaticActivityDetection": map[string]any{
+					"prefixPaddingMs": bargeInMinSpeechMs,
+				},
+			},
 		},
 	}
 
