@@ -62,6 +62,9 @@ type GeminiLiveAgent struct {
 	isModelSpeaking     atomic.Bool
 	hasSpokenWithPeer   atomic.Bool
 	wsMu              sync.Mutex
+	resumeMu          sync.Mutex
+	resumeHandle      string
+	isReconnecting    atomic.Bool
 	resampleMu        sync.Mutex
 	resampler         *media.Resampler24kTo16k
 	dsp               *media.VoiceMasteringEngine
@@ -124,8 +127,29 @@ func (g *GeminiLiveAgent) Start() error {
 	if g.started.Swap(true) {
 		return nil
 	}
+	err := g.connect(false)
+	if err == nil {
+		go g.writeAudioLoop()
+	}
+	return err
+}
+
+func (g *GeminiLiveAgent) reconnect() {
+	if g.isReconnecting.Swap(true) {
+		return
+	}
+	defer g.isReconnecting.Store(false)
+
+	g.log.Info("Gemini sent goAway, reconnecting using session resumption...")
+	err := g.connect(true)
+	if err != nil {
+		g.log.Error("failed to reconnect to Gemini API", "err", err)
+	}
+}
+
+func (g *GeminiLiveAgent) connect(isReconnect bool) error {
 	wsURL := fmt.Sprintf("wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=%s", url.QueryEscape(g.apiKey))
-	g.log.Info("connecting to Gemini 3.1 Flash Live API", "model", g.model, "voice", g.voice)
+	g.log.Info("connecting to Gemini 3.1 Flash Live API", "model", g.model, "voice", g.voice, "reconnect", isReconnect)
 
 	c, resp, err := websocket.Dial(g.ctx, wsURL, &websocket.DialOptions{
 		HTTPHeader: http.Header{},
@@ -139,13 +163,18 @@ func (g *GeminiLiveAgent) Start() error {
 		return err
 	}
 	c.SetReadLimit(32 * 1024 * 1024) // 32MB limit for large audio bursts
+
+	g.wsMu.Lock()
+	if g.ws != nil {
+		g.ws.Close(websocket.StatusNormalClosure, "reconnecting")
+	}
 	g.ws = c
+	g.wsMu.Unlock()
 	g.log.Info("connected to Gemini 3.1 Flash Live WebSocket successfully")
 
 	// Send Setup frame with thinking disabled for 0 latency
-	setupPayload := map[string]any{
-		"setup": map[string]any{
-			"model": g.model,
+	setupObj := map[string]any{
+		"model": g.model,
 			"generationConfig": map[string]any{
 				"responseModalities": []string{"AUDIO"},
 				"thinkingConfig": map[string]any{
@@ -179,7 +208,18 @@ func (g *GeminiLiveAgent) Start() error {
 					"prefixPaddingMs": bargeInMinSpeechMs,
 				},
 			},
-		},
+	}
+
+	g.resumeMu.Lock()
+	if g.resumeHandle != "" {
+		setupObj["sessionResumption"] = map[string]any{
+			"handle": g.resumeHandle,
+		}
+	}
+	g.resumeMu.Unlock()
+
+	setupPayload := map[string]any{
+		"setup": setupObj,
 	}
 
 	setupBytes, err := json.Marshal(setupPayload)
@@ -193,7 +233,6 @@ func (g *GeminiLiveAgent) Start() error {
 	}
 
 	go g.readLoop()
-	go g.writeAudioLoop()
 	return nil
 }
 
@@ -219,6 +258,11 @@ func (g *GeminiLiveAgent) readLoop() {
 				Type        string `json:"type"`
 				AudioOffset string `json:"audioOffset"`
 			} `json:"voiceActivity"`
+			SessionResumptionUpdate *struct {
+				NewHandle string `json:"newHandle"`
+				Resumable bool   `json:"resumable"`
+			} `json:"sessionResumptionUpdate"`
+			GoAway *struct{} `json:"goAway"`
 			ServerContent *struct {
 				// Audio may come in modelTurn.parts OR directly in serverContent.parts
 				Parts []struct {
@@ -272,6 +316,20 @@ func (g *GeminiLiveAgent) readLoop() {
 			g.log.Info("Gemini Live session open (setupComplete) — pre-synthesizing greeting during ring")
 			g.sendGreetingFrame()
 			continue
+		}
+
+		if resp.SessionResumptionUpdate != nil {
+			g.resumeMu.Lock()
+			if resp.SessionResumptionUpdate.NewHandle != "" {
+				g.resumeHandle = resp.SessionResumptionUpdate.NewHandle
+			}
+			g.resumeMu.Unlock()
+			continue
+		}
+
+		if resp.GoAway != nil {
+			go g.reconnect()
+			return // exit this old readLoop
 		}
 
 		sc := resp.ServerContent
