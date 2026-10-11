@@ -1,6 +1,8 @@
 /docs
 /wacalls-server.exe
 /wacalls.exe
+buildstart-calling-server*
+scratch/
 run-mlow.ps1
 *.exe
 *.test
