@@ -168,6 +168,15 @@ func (s *sessionStore) saveCallRecord(ctx context.Context, r CallRecord, busines
 	return err
 }
 
+func (s *sessionStore) updateCallRecording(ctx context.Context, callID, recordingURL string) error {
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE whatsapp_infra.call_logs
+		SET recording_url = $1
+		WHERE call_id = $2
+	`, recordingURL, callID)
+	return err
+}
+
 func (s *sessionStore) listCallHistory(ctx context.Context, sessionID string, limit int) ([]CallRecord, error) {
 	query := `SELECT call_id, session_id, direction, COALESCE(caller_number, ''),
 		started_at, connected_at, ended_at, COALESCE(duration, 0),

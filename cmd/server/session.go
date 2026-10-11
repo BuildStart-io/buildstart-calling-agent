@@ -128,6 +128,11 @@ func (s *Session) wireCall(cm *call.CallManager, callID string) {
 	cm.OnStateChange = func(c *call.CallInfo) {
 		if c.IsEnded() {
 			if ac, ok := s.reg.get(c.CallID); ok {
+				if ac.recorder != nil {
+					rec := ac.recorder
+					ac.recorder = nil
+					go uploadCallRecording(context.Background(), rec, s.mgr.store, s.log)
+				}
 				if ac.geminiLive != nil {
 					ac.geminiLive.Close()
 				}
@@ -164,6 +169,9 @@ func (s *Session) wireCall(cm *call.CallManager, callID string) {
 			rec.Status = StatusConnected
 			s.mgr.broker.recordCallEvent(c.CallID, "connected", "Call connected (Gemini Multimodal Live active)", "")
 			if ac, ok := s.reg.get(c.CallID); ok {
+				if ac.recorder == nil {
+					ac.recorder = newCallAudioRecorder(c.CallID, s.businessID, s.log.With("call_id", c.CallID))
+				}
 				if ac.geminiLive != nil {
 					ac.geminiLive.TriggerGreeting()
 				}
@@ -180,6 +188,11 @@ func (s *Session) wireCall(cm *call.CallManager, callID string) {
 			callbackJID = ac.callbackJID
 			peerAudioReceived = ac.peerAudioReceived
 			fallbackMsg = ac.fallbackMessage
+			if ac.recorder != nil {
+				rec := ac.recorder
+				ac.recorder = nil
+				go uploadCallRecording(context.Background(), rec, s.mgr.store, s.log)
+			}
 			if ac.geminiLive != nil {
 				hadConversation = ac.geminiLive.HasSpokenWithPeer()
 				ac.geminiLive.Close()
@@ -247,6 +260,10 @@ func (s *Session) wireCall(cm *call.CallManager, callID string) {
 		}
 		ac.peerAudioReceived = true
 		ac.broadcastAudio(pcm16)
+
+		if ac.recorder != nil {
+			ac.recorder.RecordCallerPCM(pcm16)
+		}
 
 		if ac.geminiLive != nil && ac.geminiLive.IsEnabled() {
 			ac.geminiLive.FeedCallerAudio(pcm16)
