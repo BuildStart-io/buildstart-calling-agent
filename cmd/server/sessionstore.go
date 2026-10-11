@@ -150,8 +150,8 @@ func (s *sessionStore) saveCallRecord(ctx context.Context, r CallRecord, busines
 		INSERT INTO whatsapp_infra.call_logs (
 			call_id, session_id, business_id, caller_number, direction,
 			started_at, connected_at, ended_at, duration,
-			status, transcript_json
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+			status, transcript_json, recording_url
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 		ON CONFLICT (call_id) DO UPDATE SET
 			caller_number = EXCLUDED.caller_number,
 			direction = EXCLUDED.direction,
@@ -159,19 +159,29 @@ func (s *sessionStore) saveCallRecord(ctx context.Context, r CallRecord, busines
 			ended_at = EXCLUDED.ended_at,
 			duration = EXCLUDED.duration,
 			status = EXCLUDED.status,
-			transcript_json = EXCLUDED.transcript_json
+			transcript_json = EXCLUDED.transcript_json,
+			recording_url = COALESCE(NULLIF(EXCLUDED.recording_url, ''), whatsapp_infra.call_logs.recording_url)
 	`,
 		r.CallID, r.SessionID, businessID, r.PeerNumber, r.Direction,
 		startedAt, connectedAt, endedAt, r.DurationSeconds,
-		string(r.Status), string(transcriptsJSON),
+		string(r.Status), string(transcriptsJSON), r.RecordingURL,
 	)
+	return err
+}
+
+func (s *sessionStore) updateCallRecording(ctx context.Context, callID, recordingURL string) error {
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE whatsapp_infra.call_logs
+		SET recording_url = $1
+		WHERE call_id = $2
+	`, recordingURL, callID)
 	return err
 }
 
 func (s *sessionStore) listCallHistory(ctx context.Context, sessionID string, limit int) ([]CallRecord, error) {
 	query := `SELECT call_id, session_id, direction, COALESCE(caller_number, ''),
 		started_at, connected_at, ended_at, COALESCE(duration, 0),
-		status, COALESCE(transcript_json, '[]'::jsonb)
+		status, COALESCE(transcript_json, '[]'::jsonb), COALESCE(recording_url, '')
 		FROM whatsapp_infra.call_logs`
 	var args []any
 	if sessionID != "" {
@@ -200,7 +210,7 @@ func (s *sessionStore) listCallHistory(ctx context.Context, sessionID string, li
 		if err := rows.Scan(
 			&r.CallID, &r.SessionID, &r.Direction, &r.PeerNumber,
 			&startedAt, &connectedAt, &endedAt, &r.DurationSeconds,
-			&statusStr, &transcriptsJSON,
+			&statusStr, &transcriptsJSON, &r.RecordingURL,
 		); err != nil {
 			return nil, err
 		}

@@ -20,9 +20,13 @@ type activeCall struct {
 	nextListenerID    int
 	greetingMessage   string
 	fallbackMessage   string
+	recorder          *CallAudioRecorder
 }
 
 func (ac *activeCall) PushAudio(pcm []float32) {
+	if ac.recorder != nil {
+		ac.recorder.RecordAgentPCM(pcm)
+	}
 	if ac.cm != nil {
 		ac.cm.FeedCapturedPCM(pcm)
 	}
