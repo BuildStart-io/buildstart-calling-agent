@@ -51,7 +51,6 @@ type CallRecord struct {
 	Events          []CallEventLog       `json:"events"`
 	Transcripts     []CallTranscriptItem `json:"transcripts"`
 	Summary         string               `json:"summary,omitempty"`
-	RecordingURL    string               `json:"recordingUrl,omitempty"`
 }
 
 func formatPhoneNumber(jidOrPhone string) string {

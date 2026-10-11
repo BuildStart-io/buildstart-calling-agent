@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"math"
 	"os"
 	"strings"
 	"sync"
@@ -62,14 +61,9 @@ func (s *Session) createCall(callID string) *call.CallManager {
 		cm: cm,
 	}
 
-	// Refresh businessID dynamically from DB in case it was updated or switched via CRM
-	if activeBizID, err := s.mgr.store.getSessionBusinessID(context.Background(), s.id); err == nil && activeBizID != "" {
-		s.businessID = activeBizID
-	}
-
 	cfg, err := s.mgr.store.getAgentConfig(context.Background(), s.businessID)
 	if err != nil {
-		s.log.Error("failed to load agent config, falling back to disabled", "err", err, "business_id", s.businessID)
+		s.log.Error("failed to load agent config, falling back to disabled", "err", err)
 	} else if os.Getenv("GEMINI_API_KEY") != "" {
 		rawKey := os.Getenv("GEMINI_API_KEY")
 		voice := cfg.VoiceModel
@@ -77,7 +71,6 @@ func (s *Session) createCall(callID string) *call.CallManager {
 			voice = "Aoede"
 		}
 		model := "models/gemini-3.1-flash-live-preview"
-		s.log.Info("call initialized with agent config", "call_id", callID, "business_id", s.businessID, "greeting", cfg.GreetingMessage, "voice", voice, "prompt_len", len(cfg.BusinessPrompt))
 		
 		basePrompt := `You are a trusted voice sales consultant in Sri Lanka — calm, warm, confident, and genuinely helpful. You are not an FAQ bot, but you never sound pushy, overexcited, theatrical, or aggressive. Guide the call naturally, understand the customer, recommend the right fit, and agree on a useful next step.
 
@@ -135,15 +128,12 @@ func (s *Session) wireCall(cm *call.CallManager, callID string) {
 	cm.OnStateChange = func(c *call.CallInfo) {
 		if c.IsEnded() {
 			if ac, ok := s.reg.get(c.CallID); ok {
-				if ac.recorder != nil {
-					rec := ac.recorder
-					ac.recorder = nil
-					go uploadCallRecording(context.Background(), rec, s.mgr.store, s.log)
-				}
 				if ac.geminiLive != nil {
 					ac.geminiLive.Close()
 				}
 			}
+			s.removeCall(c.CallID)
+			s.mgr.broker.endCall(c.CallID, string(c.StateData.EndReason))
 			return
 		}
 		dir := "outbound"
@@ -174,9 +164,6 @@ func (s *Session) wireCall(cm *call.CallManager, callID string) {
 			rec.Status = StatusConnected
 			s.mgr.broker.recordCallEvent(c.CallID, "connected", "Call connected (Gemini Multimodal Live active)", "")
 			if ac, ok := s.reg.get(c.CallID); ok {
-				if ac.recorder == nil {
-					ac.recorder = newCallAudioRecorder(c.CallID, s.businessID, s.log.With("call_id", c.CallID))
-				}
 				if ac.geminiLive != nil {
 					ac.geminiLive.TriggerGreeting()
 				}
@@ -193,11 +180,6 @@ func (s *Session) wireCall(cm *call.CallManager, callID string) {
 			callbackJID = ac.callbackJID
 			peerAudioReceived = ac.peerAudioReceived
 			fallbackMsg = ac.fallbackMessage
-			if ac.recorder != nil {
-				rec := ac.recorder
-				ac.recorder = nil
-				go uploadCallRecording(context.Background(), rec, s.mgr.store, s.log)
-			}
 			if ac.geminiLive != nil {
 				hadConversation = ac.geminiLive.HasSpokenWithPeer()
 				ac.geminiLive.Close()
@@ -266,25 +248,7 @@ func (s *Session) wireCall(cm *call.CallManager, callID string) {
 		ac.peerAudioReceived = true
 		ac.broadcastAudio(pcm16)
 
-		if ac.recorder != nil {
-			ac.recorder.RecordCallerPCM(pcm16)
-		}
-
 		if ac.geminiLive != nil && ac.geminiLive.IsEnabled() {
-			// Acoustic Echo Suppression:
-			// If the agent is currently speaking through CallManager (or in cooldown),
-			// only feed caller audio if its energy exceeds speech threshold (RMS >= 0.025).
-			// This prevents phone speaker bleed from triggering false barge-ins.
-			if ac.cm != nil && ac.cm.IsPlayingAudio() {
-				var sum float64
-				for _, sample := range pcm16 {
-					sum += float64(sample * sample)
-				}
-				rms := math.Sqrt(sum / float64(len(pcm16)))
-				if rms < 0.025 {
-					return
-				}
-			}
 			ac.geminiLive.FeedCallerAudio(pcm16)
 		}
 		if ac.bridge != nil {
@@ -297,10 +261,6 @@ func (s *Session) startOutgoingWithGreeting(ctx context.Context, peer types.JID,
 	callID := signaling.GenerateCallID()
 	cm := s.createCall(callID)
 	if ac, ok := s.reg.get(callID); ok {
-		if customGreeting != "" && ac.geminiLive != nil {
-			ac.geminiLive.SetGreetingMessage(customGreeting)
-			ac.greetingMessage = customGreeting
-		}
 		if ac.geminiLive != nil && ac.geminiLive.IsEnabled() {
 			go func() {
 				if err := ac.geminiLive.Start(); err != nil {
@@ -568,9 +528,6 @@ func (s *Session) scheduleAutoCallback(peer types.JID, reason string) {
 		ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 		defer cancel()
 
-		if activeBizID, err := s.mgr.store.getSessionBusinessID(ctx, s.id); err == nil && activeBizID != "" {
-			s.businessID = activeBizID
-		}
 		agentCfg, err := s.mgr.store.getAgentConfig(ctx, s.businessID)
 		if err != nil {
 			s.log.Error("failed to get agent config for auto-callback", "business_id", s.businessID, "err", err)
@@ -661,14 +618,9 @@ func (s *Session) info() SessionInfo {
 	if id := s.client.Store.ID; id != nil {
 		jid = id.String()
 	}
-	bizID := s.businessID
-	if activeBizID, err := s.mgr.store.getSessionBusinessID(context.Background(), s.id); err == nil && activeBizID != "" {
-		bizID = activeBizID
-		s.businessID = activeBizID
-	}
 	return SessionInfo{
 		ID:         s.id,
-		BusinessID: bizID,
+		BusinessID: s.businessID,
 		JID:        jid,
 		State:      a.State,
 		Paired:     a.Paired || jid != "",

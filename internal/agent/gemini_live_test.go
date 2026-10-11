@@ -13,7 +13,7 @@ import (
 // beyond its 100-frame capacity, the oldest frames are discarded cleanly without blocking,
 // deadlocking, or exceeding capacity.
 func TestGeminiLiveAudioBufferOverflow(t *testing.T) {
-	agent := NewGeminiLiveAgent("fake-key", "", "Aoede", "prompt", "හෙලෝ", nil)
+	agent := NewGeminiLiveAgent("fake-key", "", "Aoede", "prompt", nil)
 	defer agent.Close()
 
 	agent.SetCallActive(true)
@@ -40,7 +40,7 @@ func TestGeminiLiveAudioBufferOverflow(t *testing.T) {
 // TestGeminiLiveConcurrentFeedAndStateChange tests massive parallel concurrent operations
 // across multiple goroutines to guarantee data-race and deadlock freedom.
 func TestGeminiLiveConcurrentFeedAndStateChange(t *testing.T) {
-	agent := NewGeminiLiveAgent("fake-key", "", "Aoede", "prompt", "හෙලෝ", nil)
+	agent := NewGeminiLiveAgent("fake-key", "", "Aoede", "prompt", nil)
 	defer agent.Close()
 
 	var wg sync.WaitGroup
@@ -133,7 +133,7 @@ func TestPCMConversionEdgeCases(t *testing.T) {
 // TestTriggerGreetingConcurrency verifies calling TriggerGreeting multiple times
 // concurrently is completely idempotent (only triggers once).
 func TestTriggerGreetingConcurrency(t *testing.T) {
-	agent := NewGeminiLiveAgent("fake-key", "", "Aoede", "prompt", "හෙලෝ", nil)
+	agent := NewGeminiLiveAgent("fake-key", "", "Aoede", "prompt", nil)
 	defer agent.Close()
 
 	var wg sync.WaitGroup
@@ -156,7 +156,7 @@ func TestTriggerGreetingConcurrency(t *testing.T) {
 
 // TestEmptyAudioHandling verifies that feeding nil or empty slices to FeedCallerAudio is a no-op.
 func TestEmptyAudioHandling(t *testing.T) {
-	agent := NewGeminiLiveAgent("fake-key", "", "Aoede", "prompt", "හෙලෝ", nil)
+	agent := NewGeminiLiveAgent("fake-key", "", "Aoede", "prompt", nil)
 	defer agent.Close()
 
 	agent.SetCallActive(true)
