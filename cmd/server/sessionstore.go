@@ -255,3 +255,9 @@ func (s *sessionStore) getAgentConfig(ctx context.Context, businessID string) (A
 	}
 	return r, nil
 }
+
+func (s *sessionStore) getSessionBusinessID(ctx context.Context, sessionID string) (string, error) {
+	var businessID string
+	err := s.db.QueryRowContext(ctx, `SELECT business_id FROM whatsapp_infra.whatsapp_sessions WHERE session_id = $1`, sessionID).Scan(&businessID)
+	return businessID, err
+}
