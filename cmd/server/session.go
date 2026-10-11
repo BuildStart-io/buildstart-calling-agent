@@ -62,9 +62,14 @@ func (s *Session) createCall(callID string) *call.CallManager {
 		cm: cm,
 	}
 
+	// Refresh businessID dynamically from DB in case it was updated or switched via CRM
+	if activeBizID, err := s.mgr.store.getSessionBusinessID(context.Background(), s.id); err == nil && activeBizID != "" {
+		s.businessID = activeBizID
+	}
+
 	cfg, err := s.mgr.store.getAgentConfig(context.Background(), s.businessID)
 	if err != nil {
-		s.log.Error("failed to load agent config, falling back to disabled", "err", err)
+		s.log.Error("failed to load agent config, falling back to disabled", "err", err, "business_id", s.businessID)
 	} else if os.Getenv("GEMINI_API_KEY") != "" {
 		rawKey := os.Getenv("GEMINI_API_KEY")
 		voice := cfg.VoiceModel
@@ -72,6 +77,7 @@ func (s *Session) createCall(callID string) *call.CallManager {
 			voice = "Aoede"
 		}
 		model := "models/gemini-3.1-flash-live-preview"
+		s.log.Info("call initialized with agent config", "call_id", callID, "business_id", s.businessID, "greeting", cfg.GreetingMessage, "voice", voice, "prompt_len", len(cfg.BusinessPrompt))
 		
 		basePrompt := `You are a trusted voice sales consultant in Sri Lanka — calm, warm, confident, and genuinely helpful. You are not an FAQ bot, but you never sound pushy, overexcited, theatrical, or aggressive. Guide the call naturally, understand the customer, recommend the right fit, and agree on a useful next step.
 
@@ -562,6 +568,9 @@ func (s *Session) scheduleAutoCallback(peer types.JID, reason string) {
 		ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 		defer cancel()
 
+		if activeBizID, err := s.mgr.store.getSessionBusinessID(ctx, s.id); err == nil && activeBizID != "" {
+			s.businessID = activeBizID
+		}
 		agentCfg, err := s.mgr.store.getAgentConfig(ctx, s.businessID)
 		if err != nil {
 			s.log.Error("failed to get agent config for auto-callback", "business_id", s.businessID, "err", err)
@@ -652,9 +661,14 @@ func (s *Session) info() SessionInfo {
 	if id := s.client.Store.ID; id != nil {
 		jid = id.String()
 	}
+	bizID := s.businessID
+	if activeBizID, err := s.mgr.store.getSessionBusinessID(context.Background(), s.id); err == nil && activeBizID != "" {
+		bizID = activeBizID
+		s.businessID = activeBizID
+	}
 	return SessionInfo{
 		ID:         s.id,
-		BusinessID: s.businessID,
+		BusinessID: bizID,
 		JID:        jid,
 		State:      a.State,
 		Paired:     a.Paired || jid != "",
