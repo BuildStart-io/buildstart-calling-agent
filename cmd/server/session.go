@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"math"
 	"os"
 	"strings"
 	"sync"
@@ -264,6 +265,20 @@ func (s *Session) wireCall(cm *call.CallManager, callID string) {
 		}
 
 		if ac.geminiLive != nil && ac.geminiLive.IsEnabled() {
+			// Acoustic Echo Suppression:
+			// If the agent is currently speaking through CallManager (or in cooldown),
+			// only feed caller audio if its energy exceeds speech threshold (RMS >= 0.025).
+			// This prevents phone speaker bleed from triggering false barge-ins.
+			if ac.cm != nil && ac.cm.IsPlayingAudio() {
+				var sum float64
+				for _, sample := range pcm16 {
+					sum += float64(sample * sample)
+				}
+				rms := math.Sqrt(sum / float64(len(pcm16)))
+				if rms < 0.025 {
+					return
+				}
+			}
 			ac.geminiLive.FeedCallerAudio(pcm16)
 		}
 		if ac.bridge != nil {
@@ -276,6 +291,10 @@ func (s *Session) startOutgoingWithGreeting(ctx context.Context, peer types.JID,
 	callID := signaling.GenerateCallID()
 	cm := s.createCall(callID)
 	if ac, ok := s.reg.get(callID); ok {
+		if customGreeting != "" && ac.geminiLive != nil {
+			ac.geminiLive.SetGreetingMessage(customGreeting)
+			ac.greetingMessage = customGreeting
+		}
 		if ac.geminiLive != nil && ac.geminiLive.IsEnabled() {
 			go func() {
 				if err := ac.geminiLive.Start(); err != nil {

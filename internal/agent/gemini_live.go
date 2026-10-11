@@ -61,6 +61,7 @@ type GeminiLiveAgent struct {
 	interruptedThisTurn atomic.Bool
 	isModelSpeaking     atomic.Bool
 	hasSpokenWithPeer   atomic.Bool
+	isGreetingActive    atomic.Bool
 	wsMu              sync.Mutex
 	resumeMu          sync.Mutex
 	resumeHandle      string
@@ -339,16 +340,20 @@ func (g *GeminiLiveAgent) readLoop() {
 
 		// Handle user barge-in / interruption from serverContent
 		if sc.Interrupted {
-			g.log.Info("Gemini detected caller interruption (barge-in)")
-			g.interruptedThisTurn.Store(true)
-			g.isModelSpeaking.Store(false)
-			if g.OnInterrupt != nil {
-				g.OnInterrupt()
+			if g.isGreetingActive.Load() {
+				g.log.Info("ignoring premature barge-in during initial greeting playback")
+			} else {
+				g.log.Info("Gemini detected caller interruption (barge-in)")
+				g.interruptedThisTurn.Store(true)
+				g.isModelSpeaking.Store(false)
+				if g.OnInterrupt != nil {
+					g.OnInterrupt()
+				}
+				g.resampleMu.Lock()
+				g.resampler.Reset()
+				g.dsp.Reset()
+				g.resampleMu.Unlock()
 			}
-			g.resampleMu.Lock()
-			g.resampler.Reset()
-			g.dsp.Reset()
-			g.resampleMu.Unlock()
 		}
 
 		// Transcription of caller speech
@@ -399,16 +404,25 @@ func (g *GeminiLiveAgent) readLoop() {
 				g.resampleMu.Unlock()
 
 				if len(mastered) > 0 {
-					if g.callActive.Load() {
+					g.prewarmMu.Lock()
+					if !g.callActive.Load() {
+						// Ringing: buffer pre-synthesized greeting
+						g.prewarmedGreeting = append(g.prewarmedGreeting, mastered...)
+						g.prewarmMu.Unlock()
+					} else {
+						// Call active: drain any buffered chunks first in strict chronological order
+						if len(g.prewarmedGreeting) > 0 {
+							buffered := g.prewarmedGreeting
+							g.prewarmedGreeting = nil
+							if g.FeedAudio != nil {
+								g.FeedAudio(buffered)
+							}
+						}
+						g.prewarmMu.Unlock()
+
 						if g.FeedAudio != nil {
 							g.FeedAudio(mastered)
 						}
-					} else {
-						g.prewarmMu.Lock()
-						// Accumulate the entire pre-warmed greeting so custom
-						// multi-sentence greetings play fully upon pickup.
-						g.prewarmedGreeting = append(g.prewarmedGreeting, mastered...)
-						g.prewarmMu.Unlock()
 					}
 				}
 			}
@@ -432,6 +446,10 @@ func (g *GeminiLiveAgent) readLoop() {
 		if sc.TurnComplete {
 			g.isModelSpeaking.Store(false)
 			g.interruptedThisTurn.Store(false)
+			if g.isGreetingActive.Load() {
+				g.log.Info("initial greeting turn complete from Gemini")
+				g.isGreetingActive.Store(false)
+			}
 			g.latMu.Lock()
 			g.loggedLatencyThisTurn = false
 			g.latMu.Unlock()
@@ -532,19 +550,17 @@ func (g *GeminiLiveAgent) TriggerGreeting() {
 	}
 
 	// Flush pre-synthesized greeting audio immediately to WhatsApp
+	var buffered []float32
 	g.prewarmMu.Lock()
-	buffered := g.prewarmedGreeting
-	g.prewarmedGreeting = nil
+	if len(g.prewarmedGreeting) > 0 {
+		buffered = g.prewarmedGreeting
+		g.prewarmedGreeting = nil
+	}
 	g.prewarmMu.Unlock()
 
 	if g.FeedAudio != nil && len(buffered) > 0 {
 		g.log.Info("⚡ Playing pre-synthesized greeting at T=0 pickup", "samples", len(buffered), "duration_ms", len(buffered)/16)
-		// Run in goroutine: TriggerGreeting may be called while CallManager.mu is held
-		// (via emitState → OnStateChange). FeedAudio → FeedCapturedPCM also acquires
-		// CallManager.mu, causing a deadlock if called synchronously. The 150ms delay
-		// also ensures startSilenceKeepaliveLocked has started the RTP ticker.
 		go func() {
-			time.Sleep(150 * time.Millisecond)
 			g.FeedAudio(buffered)
 		}()
 	}
@@ -552,6 +568,16 @@ func (g *GeminiLiveAgent) TriggerGreeting() {
 
 func (g *GeminiLiveAgent) sendGreetingFrame() {
 	g.log.Info("triggering initial greeting in Sinhala upon call pickup")
+	g.isGreetingActive.Store(true)
+	// Safety watchdog: ensure isGreetingActive expires after 12s max if Gemini hangs
+	go func() {
+		time.Sleep(12 * time.Second)
+		if g.isGreetingActive.Load() {
+			g.log.Warn("safety timeout: clearing isGreetingActive after 12s")
+			g.isGreetingActive.Store(false)
+		}
+	}()
+
 	if g.OnState != nil {
 		g.OnState(StateListening)
 	}
@@ -584,6 +610,10 @@ func (g *GeminiLiveAgent) FeedCallerAudio(pcm16 []float32) {
 	if !g.enabled.Load() || g.closed.Load() || !g.callActive.Load() || len(pcm16) == 0 {
 		return
 	}
+	if g.isGreetingActive.Load() {
+		// Do not feed caller background noise or speaker echo to Gemini while greeting is active
+		return
+	}
 	g.hasSpokenWithPeer.Store(true)
 	g.latMu.Lock()
 	g.lastCallerAudioAt = time.Now()
@@ -602,6 +632,12 @@ func (g *GeminiLiveAgent) FeedCallerAudio(pcm16 []float32) {
 		case g.audioInCh <- pcm16:
 		default:
 		}
+	}
+}
+
+func (g *GeminiLiveAgent) SetGreetingMessage(msg string) {
+	if msg != "" {
+		g.greetingMessage = msg
 	}
 }
 
