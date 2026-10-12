@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"log/slog"
+	"strings"
 	"time"
 
 	"go.mau.fi/whatsmeow/types"
@@ -63,13 +64,22 @@ func processScheduledCalls(ctx context.Context, db *sql.DB, mgr *SessionManager,
 		}
 
 		if targetSession == nil {
+			for _, s := range mgr.allSessions() {
+				if s.client != nil && s.client.IsConnected() {
+					targetSession = s
+					break
+				}
+			}
+		}
+
+		if targetSession == nil {
 			log.Warn("no active session for scheduled call", "business_id", c.BusinessID, "call_id", c.ID)
 			updateScheduledCallStatus(ctx, db, c.ID, "failed_no_session")
 			continue
 		}
 
-		// Prepare JID
-		phone := c.PhoneNumber
+		// Prepare JID: clean phone number of '+', spaces, and dashes
+		phone := strings.TrimPrefix(strings.ReplaceAll(strings.ReplaceAll(c.PhoneNumber, " ", ""), "-", ""), "+")
 		peer := types.NewJID(phone, types.DefaultUserServer)
 
 		// Start outbound call
