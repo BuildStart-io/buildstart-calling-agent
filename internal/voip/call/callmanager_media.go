@@ -195,8 +195,15 @@ func (m *CallManager) onRelayData(data []byte) {
 	if len(data) < 12 {
 		return
 	}
+
+	// Ignore multiplexed RTCP control packets (RFC 3550 packet types 200..208: SR, RR, SDES, BYE, etc.)
+	if data[1] >= 200 && data[1] <= 208 {
+		return
+	}
+
 	pt := data[1] & 0x7f
-	if pt != core.PayloadTypeWhatsAppOpus {
+	if !core.IsAudioPayloadType(pt) {
+		m.log.Debug("ignoring non-audio RTP packet", "pt", pt)
 		return
 	}
 
