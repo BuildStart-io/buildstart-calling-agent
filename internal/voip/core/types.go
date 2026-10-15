@@ -40,8 +40,18 @@ const (
 )
 
 const (
-	PayloadTypeWhatsAppOpus = 120
+	PayloadTypeWhatsAppOpus    = 120
+	PayloadTypeWhatsAppOpusAlt = 121
+	PayloadTypeWhatsAppMLow    = 122
 )
+
+// IsAudioPayloadType returns true if the dynamic RTP payload type belongs to WhatsApp audio (120, 121, 122, or dynamic 96-127).
+func IsAudioPayloadType(pt uint8) bool {
+	return pt == PayloadTypeWhatsAppOpus ||
+		pt == PayloadTypeWhatsAppOpusAlt ||
+		pt == PayloadTypeWhatsAppMLow ||
+		(pt >= 96 && pt <= 127)
+}
 
 const (
 	SRTPSendAuthTagLen = 4

@@ -48,3 +48,20 @@ func TestCallManagerIsPlayingAudioAcousticGating(t *testing.T) {
 		t.Fatal("expected IsPlayingAudio() == false after acoustic echo cooldown expires")
 	}
 }
+
+func TestIsAudioPayloadType(t *testing.T) {
+	audioPTs := []uint8{120, 121, 122, 96, 127}
+	for _, pt := range audioPTs {
+		if !core.IsAudioPayloadType(pt) {
+			t.Errorf("expected IsAudioPayloadType(%d) == true, got false", pt)
+		}
+	}
+
+	nonAudioPTs := []uint8{0, 8, 72, 74, 78, 80, 200, 201}
+	for _, pt := range nonAudioPTs {
+		if core.IsAudioPayloadType(pt) {
+			t.Errorf("expected IsAudioPayloadType(%d) == false, got true", pt)
+		}
+	}
+}
+
