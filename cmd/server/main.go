@@ -76,6 +76,8 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	refreshWAVersion(ctx, log, true)
+
 	srv, err := newServer(ctx, *dbPath, *staticDir, *maxCalls, log)
 	if err != nil {
 		log.Error("startup failed", "err", err)

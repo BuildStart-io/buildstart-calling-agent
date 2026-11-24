@@ -590,16 +590,31 @@ func (s *Session) connect(ctx context.Context) error {
 	return s.startPairing(ctx)
 }
 
+func (s *Session) isCurrentClient(c *whatsmeow.Client) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.client == c
+}
+
 func (s *Session) startPairing(ctx context.Context) error {
-	qrChan, err := s.client.GetQRChannel(ctx)
+	refreshWAVersion(ctx, s.log, false)
+	s.mu.Lock()
+	client := s.client
+	s.mu.Unlock()
+
+	s.setAuth(AuthSnapshot{State: "connecting", Paired: false})
+	qrChan, err := client.GetQRChannel(ctx)
 	if err != nil {
 		return err
 	}
-	if err := s.client.Connect(); err != nil {
+	if err := client.Connect(); err != nil {
 		return err
 	}
 	go func() {
 		for evt := range qrChan {
+			if !s.isCurrentClient(client) {
+				return
+			}
 			switch evt.Event {
 			case "code":
 				s.log.Info("scan the QR code to pair this session")
@@ -607,11 +622,25 @@ func (s *Session) startPairing(ctx context.Context) error {
 				s.setAuth(AuthSnapshot{State: "qr", QR: evt.Code})
 				s.mgr.broker.emitSessionQR(s.id, evt.Code)
 			case "success":
-				if id := s.client.Store.ID; id != nil {
+				if id := client.Store.ID; id != nil {
 					_ = s.mgr.store.setJID(s.mgr.appCtx, s.id, id.String())
 				}
 				s.setAuth(AuthSnapshot{State: "open", Paired: true})
+			case "err-client-outdated":
+				s.log.Warn("WhatsApp client version outdated during pairing; refreshing version and retrying")
+				refreshWAVersion(s.mgr.appCtx, s.log, true)
+				go func() {
+					if err := s.mgr.Pair(s.id); err != nil {
+						s.log.Error("re-pair after version refresh failed", "err", err)
+						s.setAuth(AuthSnapshot{State: "logged_out", Paired: false})
+					}
+				}()
+				return
 			case "timeout":
+				s.log.Info("QR pairing timed out")
+				s.setAuth(AuthSnapshot{State: "logged_out", Paired: false})
+			default:
+				s.log.Warn("QR pairing ended", "event", evt.Event, "err", evt.Error)
 				s.setAuth(AuthSnapshot{State: "logged_out", Paired: false})
 			}
 		}
@@ -685,8 +714,13 @@ func (s *Session) teardownAllCalls() {
 
 func (s *Session) replaceClient(client *whatsmeow.Client) {
 	s.teardownAllCalls()
-	s.client.Disconnect()
+	s.mu.Lock()
+	oldClient := s.client
 	s.client = client
+	s.mu.Unlock()
+	if oldClient != nil {
+		oldClient.Disconnect()
+	}
 	client.AddEventHandler(s.handleEvent)
 }
 

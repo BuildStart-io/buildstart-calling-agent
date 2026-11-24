@@ -37,7 +37,9 @@ func (s *server) routes() http.Handler {
 	mux.HandleFunc("DELETE /api/sessions/{sid}", s.handleSessionDelete)
 	mux.HandleFunc("DELETE /api/v1/sessions/{sid}", s.handleSessionDelete)
 	mux.HandleFunc("POST /api/sessions/{sid}/logout", s.handleSessionLogout)
+	mux.HandleFunc("POST /api/v1/sessions/{sid}/logout", s.handleSessionLogout)
 	mux.HandleFunc("POST /api/sessions/{sid}/pair", s.handleSessionPair)
+	mux.HandleFunc("POST /api/v1/sessions/{sid}/pair", s.handleSessionPair)
 
 	// Direct Call Dialing & Listing (no sid needed - uses default connected session)
 	mux.HandleFunc("GET /api/calls", s.handleCallsList)
