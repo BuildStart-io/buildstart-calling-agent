@@ -183,11 +183,9 @@ func (s *Session) wireCall(cm *call.CallManager, callID string) {
 		var hadConversation bool
 		var peerAudioReceived bool
 		var callbackJID types.JID
-		var fallbackMsg string
 		if ac, ok := s.reg.get(c.CallID); ok {
 			callbackJID = ac.callbackJID
 			peerAudioReceived = ac.peerAudioReceived
-			fallbackMsg = ac.fallbackMessage
 			if ac.recorder != nil {
 				rec := ac.recorder
 				ac.recorder = nil
@@ -236,14 +234,7 @@ func (s *Session) wireCall(cm *call.CallManager, callID string) {
 				resolvedPeerNum := s.mgr.store.resolvePhone(dialJID.User)
 				s.mgr.broker.recordCallEvent(c.CallID, "callback_trigger", "Auto-Callback & Message scheduled to "+resolvedPeerNum, "Reason: caller_unanswered")
 
-				// 1. Send immediate WhatsApp text notification to caller
-				msgText := "ආයුබෝවන්! ඔබ අප අමතන්නට උත්සාහ කළ බව දුටුවෙමි. අපගේ AI හඬ සහායකයා මේ මොහොතේම ඔබව නැවත අමතනු ඇත."
-				if fallbackMsg != "" {
-					msgText = fallbackMsg
-				}
-				s.sendWhatsAppMessage(dialJID, msgText)
-
-				// 2. Schedule instant AI auto-callback
+				// Schedule instant AI auto-callback (notification is sent inside scheduleAutoCallback once debounce & active checks pass)
 				s.scheduleAutoCallback(dialJID.ToNonAD(), "inbound_unanswered_caller_hangup")
 			}
 		} else {
@@ -527,14 +518,31 @@ func (s *Session) scheduleAutoCallback(peer types.JID, reason string) {
 	}
 
 	peerStr := peer.ToNonAD().String()
+	hasActiveCallWithPeer := func() bool {
+		for _, ac := range s.reg.all() {
+			if ac.cm != nil {
+				c := ac.cm.CurrentCall()
+				if c != nil && !c.IsEnded() && (strings.Contains(c.PeerJid, peer.User) || strings.Contains(ac.callbackJID.User, peer.User)) {
+					return true
+				}
+			}
+		}
+		return false
+	}
+
+	if hasActiveCallWithPeer() {
+		s.log.Info("skipping auto-callback, call already active or ringing with peer", "peer", peerStr, "reason", reason)
+		return
+	}
+
 	s.lastCallbackMu.Lock()
 	if s.lastCallbacks == nil {
 		s.lastCallbacks = make(map[string]time.Time)
 	}
 	last, exists := s.lastCallbacks[peerStr]
-	if exists && time.Since(last) < 2*time.Minute {
+	if exists && time.Since(last) < 8*time.Second {
 		s.lastCallbackMu.Unlock()
-		s.log.Debug("auto-callback debounced (called recently)", "peer", peerStr, "reason", reason)
+		s.log.Info("auto-callback debounced (triggered within 8s)", "peer", peerStr, "reason", reason)
 		return
 	}
 	s.lastCallbacks[peerStr] = time.Now()
@@ -551,22 +559,21 @@ func (s *Session) scheduleAutoCallback(peer types.JID, reason string) {
 			return
 		}
 
-		if agentCfg.FallbackMessage != "" {
-			s.sendWhatsAppMessage(peer, agentCfg.FallbackMessage)
+		msgText := agentCfg.FallbackMessage
+		if msgText == "" && reason == "inbound_unanswered_caller_hangup" {
+			msgText = "ආයුබෝවන්! ඔබ අප අමතන්නට උත්සාහ කළ බව දුටුවෙමි. අපගේ AI හඬ සහායකයා මේ මොහොතේම ඔබව නැවත අමතනු ඇත."
+		}
+		if msgText != "" {
+			s.sendWhatsAppMessage(peer, msgText)
 		}
 
 		// Wait 4.0s so the caller's phone returns to idle state from the previous attempt
 		time.Sleep(4000 * time.Millisecond)
 
-		// Check if we already have an active call with this peer
-		for _, ac := range s.reg.all() {
-			if ac.cm != nil {
-				c := ac.cm.CurrentCall()
-				if c != nil && !c.IsEnded() && c.IsActive() && strings.Contains(c.PeerJid, peer.User) {
-					s.log.Info("skipping auto-callback, call already active with peer", "peer", peerStr)
-					return
-				}
-			}
+		// Check if we already have an active or ringing call with this peer
+		if hasActiveCallWithPeer() {
+			s.log.Info("skipping auto-callback after delay, call already active with peer", "peer", peerStr)
+			return
 		}
 
 		callbackGreeting := "ආයුබෝවන්! ඔබ මීට සුළු මොහොතකට පෙර අප අමතන්නට උත්සාහ කළ බව දුටුවෙමි. මම ඔබගේ AI හඬ සහායකයා. ඔබට අද මම කොහොමද උදවු කරන්නේ?"

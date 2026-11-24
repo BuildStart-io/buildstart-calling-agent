@@ -244,6 +244,28 @@ func (m *CallManager) onRelayData(data []byte) {
 		return
 	}
 	pcm = media.NormalizeFrame(pcm, codec.FrameSize())
+	if len(pcm) > 0 {
+		m.mu.Lock()
+		if call := m.currentCall; call != nil && !call.IsEnded() && call.Direction == core.CallDirectionOutgoing {
+			stateChanged := false
+			if call.StateData.State == core.CallStateRinging {
+				if err := call.ApplyTransition(Transition{Type: TransitionRemoteAccepted}); err == nil {
+					stateChanged = true
+				}
+			}
+			if call.StateData.State == core.CallStateConnecting {
+				if err := call.ApplyTransition(Transition{Type: TransitionMediaConnected}); err == nil {
+					stateChanged = true
+					m.startSilenceKeepaliveLocked()
+					m.log.Info("outbound call ACTIVE via incoming peer audio (accept stanza delayed)", "call_id", call.CallID)
+				}
+			}
+			if stateChanged {
+				m.emitState()
+			}
+		}
+		m.mu.Unlock()
+	}
 	if m.OnPeerAudio != nil {
 		m.OnPeerAudio(pcm)
 	}

@@ -203,8 +203,9 @@ func (m *CallManager) HandleCallAccept(ctx context.Context, node *waBinary.Node,
 	}
 
 	m.mu.Lock()
-	_ = call.ApplyTransition(Transition{Type: TransitionRemoteAccepted})
-	m.emitState()
+	if err := call.ApplyTransition(Transition{Type: TransitionRemoteAccepted}); err == nil {
+		m.emitState()
+	}
 	m.acceptedByJid = peerJid.String()
 	if m.peerSsrcs == nil || !m.actualPeerSet {
 		peerDeviceJid := ensureDeviceJid(peerJid.String())

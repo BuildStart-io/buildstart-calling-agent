@@ -67,3 +67,31 @@ func TestIsAudioPayloadType(t *testing.T) {
 	}
 }
 
+func TestOutboundCallPromotesFromRingingToActive(t *testing.T) {
+	call := NewOutgoingCall("TESTCALL1", "94769652770@s.whatsapp.net", "94740979087@s.whatsapp.net", core.CallMediaTypeAudio)
+	if err := call.ApplyTransition(Transition{Type: TransitionOfferSent}); err != nil {
+		t.Fatalf("unexpected TransitionOfferSent err: %v", err)
+	}
+	if call.StateData.State != core.CallStateRinging {
+		t.Fatalf("expected CallStateRinging, got %s", call.StateData.State)
+	}
+
+	// Simulate incoming decrypted peer audio arriving before WhatsApp <accept> stanza
+	if err := call.ApplyTransition(Transition{Type: TransitionRemoteAccepted}); err != nil {
+		t.Fatalf("unexpected TransitionRemoteAccepted err: %v", err)
+	}
+	if err := call.ApplyTransition(Transition{Type: TransitionMediaConnected}); err != nil {
+		t.Fatalf("unexpected TransitionMediaConnected err: %v", err)
+	}
+	if !call.IsActive() {
+		t.Fatalf("expected IsActive() == true, got state %s", call.StateData.State)
+	}
+	// Late HandleCallAccept should fail TransitionRemoteAccepted gracefully without mutating state
+	if err := call.ApplyTransition(Transition{Type: TransitionRemoteAccepted}); err == nil {
+		t.Fatal("expected TransitionRemoteAccepted to fail when already active")
+	}
+	if !call.IsActive() {
+		t.Fatalf("expected call to remain active, got %s", call.StateData.State)
+	}
+}
+
