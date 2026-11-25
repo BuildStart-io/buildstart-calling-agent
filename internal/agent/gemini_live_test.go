@@ -13,7 +13,7 @@ import (
 // beyond its 100-frame capacity, the oldest frames are discarded cleanly without blocking,
 // deadlocking, or exceeding capacity.
 func TestGeminiLiveAudioBufferOverflow(t *testing.T) {
-	agent := NewGeminiLiveAgent("fake-key", "", "Aoede", "prompt", nil)
+	agent := NewGeminiLiveAgent("fake-key", "", "Aoede", "prompt", "", nil)
 	defer agent.Close()
 
 	agent.SetCallActive(true)
@@ -40,7 +40,7 @@ func TestGeminiLiveAudioBufferOverflow(t *testing.T) {
 // TestGeminiLiveConcurrentFeedAndStateChange tests massive parallel concurrent operations
 // across multiple goroutines to guarantee data-race and deadlock freedom.
 func TestGeminiLiveConcurrentFeedAndStateChange(t *testing.T) {
-	agent := NewGeminiLiveAgent("fake-key", "", "Aoede", "prompt", nil)
+	agent := NewGeminiLiveAgent("fake-key", "", "Aoede", "prompt", "", nil)
 	defer agent.Close()
 
 	var wg sync.WaitGroup
@@ -133,7 +133,7 @@ func TestPCMConversionEdgeCases(t *testing.T) {
 // TestTriggerGreetingConcurrency verifies calling TriggerGreeting multiple times
 // concurrently is completely idempotent (only triggers once).
 func TestTriggerGreetingConcurrency(t *testing.T) {
-	agent := NewGeminiLiveAgent("fake-key", "", "Aoede", "prompt", nil)
+	agent := NewGeminiLiveAgent("fake-key", "", "Aoede", "prompt", "", nil)
 	defer agent.Close()
 
 	var wg sync.WaitGroup
@@ -156,7 +156,7 @@ func TestTriggerGreetingConcurrency(t *testing.T) {
 
 // TestEmptyAudioHandling verifies that feeding nil or empty slices to FeedCallerAudio is a no-op.
 func TestEmptyAudioHandling(t *testing.T) {
-	agent := NewGeminiLiveAgent("fake-key", "", "Aoede", "prompt", nil)
+	agent := NewGeminiLiveAgent("fake-key", "", "Aoede", "prompt", "", nil)
 	defer agent.Close()
 
 	agent.SetCallActive(true)
@@ -248,15 +248,15 @@ func TestGeminiLiveServerContentUnmarshaling(t *testing.T) {
 
 	// 4. Caller and agent transcripts
 	var msg4 serverMsg
-	jsonTranscripts := `{"serverContent":{"inputTranscription":{"text":"hello"},"outputTranscription":{"text":"හෙලෝ"}}}`
+	jsonTranscripts := `{"serverContent":{"inputTranscription":{"text":"hello"},"outputTranscription":{"text":"Hello there"}}}`
 	if err := json.Unmarshal([]byte(jsonTranscripts), &msg4); err != nil {
 		t.Fatalf("failed to unmarshal transcripts: %v", err)
 	}
 	if msg4.ServerContent.InputTranscription.Text != "hello" {
 		t.Errorf("expected inputTranscription 'hello', got %s", msg4.ServerContent.InputTranscription.Text)
 	}
-	if msg4.ServerContent.OutputTranscription.Text != "හෙලෝ" {
-		t.Errorf("expected outputTranscription 'හෙලෝ', got %s", msg4.ServerContent.OutputTranscription.Text)
+	if msg4.ServerContent.OutputTranscription.Text != "Hello there" {
+		t.Errorf("expected outputTranscription 'Hello there', got %s", msg4.ServerContent.OutputTranscription.Text)
 	}
 }
 

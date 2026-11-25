@@ -248,25 +248,17 @@ func uploadCallRecording(ctx context.Context, rec *CallAudioRecorder, store *ses
 		return
 	}
 
-	endpoint := os.Getenv("MINIO_ENDPOINT")
-	if endpoint == "" {
-		endpoint = "127.0.0.1:9000"
-	}
-	accessKey := os.Getenv("MINIO_ACCESS_KEY")
-	if accessKey == "" {
-		accessKey = "admin"
-	}
-	secretKey := os.Getenv("MINIO_SECRET_KEY")
-	if secretKey == "" {
-		secretKey = ""
-	}
-	bucket := os.Getenv("MINIO_BUCKET")
+	endpoint := strings.TrimSpace(os.Getenv("MINIO_ENDPOINT"))
+	accessKey := strings.TrimSpace(os.Getenv("MINIO_ACCESS_KEY"))
+	secretKey := strings.TrimSpace(os.Getenv("MINIO_SECRET_KEY"))
+	bucket := strings.TrimSpace(os.Getenv("MINIO_BUCKET"))
 	if bucket == "" {
 		bucket = "call-recordings"
 	}
-	publicBase := os.Getenv("MINIO_PUBLIC_URL")
-	if publicBase == "" {
-		publicBase = "https://storage.buildstart.io/call-recordings"
+	publicBase := strings.TrimSpace(os.Getenv("MINIO_PUBLIC_URL"))
+	if endpoint == "" || accessKey == "" || secretKey == "" || publicBase == "" {
+		log.Warn("call recording upload skipped: MINIO_ENDPOINT, MINIO_ACCESS_KEY, MINIO_SECRET_KEY, or MINIO_PUBLIC_URL not set", "call_id", rec.callID)
+		return
 	}
 
 	client, err := minio.New(endpoint, &minio.Options{

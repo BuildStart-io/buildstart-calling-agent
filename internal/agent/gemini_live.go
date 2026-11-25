@@ -102,7 +102,7 @@ func NewGeminiLiveAgent(apiKey, model, voice, systemPrompt, greetingMessage stri
 		voice = "Aoede"
 	}
 	if greetingMessage == "" {
-		greetingMessage = "හෙලෝ"
+		greetingMessage = "Hello"
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -551,7 +551,7 @@ func (g *GeminiLiveAgent) TriggerGreeting() {
 }
 
 func (g *GeminiLiveAgent) sendGreetingFrame() {
-	g.log.Info("triggering initial greeting in Sinhala upon call pickup")
+	g.log.Info("pre-synthesizing initial greeting")
 	if g.OnState != nil {
 		g.OnState(StateListening)
 	}

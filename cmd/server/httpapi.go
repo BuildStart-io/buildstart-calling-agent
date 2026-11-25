@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -40,6 +41,8 @@ func (s *server) routes() http.Handler {
 	mux.HandleFunc("POST /api/v1/sessions/{sid}/logout", s.handleSessionLogout)
 	mux.HandleFunc("POST /api/sessions/{sid}/pair", s.handleSessionPair)
 	mux.HandleFunc("POST /api/v1/sessions/{sid}/pair", s.handleSessionPair)
+	mux.HandleFunc("POST /api/sessions/{sid}/messages/send", s.handleSessionSendMessage)
+	mux.HandleFunc("POST /api/v1/sessions/{sid}/messages/send", s.handleSessionSendMessage)
 
 	// Direct Call Dialing & Listing (no sid needed - uses default connected session)
 	mux.HandleFunc("GET /api/calls", s.handleCallsList)
@@ -102,7 +105,7 @@ func (s *server) withCORS(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		s.log.Info("http request", "method", r.Method, "path", r.URL.Path, "remote", r.RemoteAddr)
 		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-Client-Id, Authorization")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-Client-Id, Authorization, X-Api-Key")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
@@ -273,7 +276,7 @@ func (s *server) handleCallsList(w http.ResponseWriter, r *http.Request) {
 	var list []map[string]any
 	host := r.Host
 	if host == "" {
-		host = "buildstart-calling-agent.buildstart.io"
+		host = publicStreamHost()
 	}
 	for _, c := range s.broker.calls {
 		streamURL := fmt.Sprintf("wss://%s/api/v1/calls/%s/audio", host, c.CallID)
@@ -307,7 +310,7 @@ func (s *server) handleCallGet(w http.ResponseWriter, r *http.Request) {
 	}
 	host := r.Host
 	if host == "" {
-		host = "buildstart-calling-agent.buildstart.io"
+		host = publicStreamHost()
 	}
 	streamURL := fmt.Sprintf("wss://%s/api/v1/calls/%s/audio", host, c.CallID)
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -409,7 +412,7 @@ func (s *server) handleDirectDial(w http.ResponseWriter, r *http.Request) {
 
 	host := r.Host
 	if host == "" {
-		host = "buildstart-calling-agent.buildstart.io"
+		host = publicStreamHost()
 	}
 	streamURL := fmt.Sprintf("wss://%s/api/v1/calls/%s/audio", host, callID)
 
@@ -691,7 +694,7 @@ func (s *server) doStartCall(sess *Session, w http.ResponseWriter, r *http.Reque
 	})
 	host := r.Host
 	if host == "" {
-		host = "buildstart-calling-agent.buildstart.io"
+		host = publicStreamHost()
 	}
 	streamURL := fmt.Sprintf("wss://%s/api/v1/calls/%s/audio", host, callID)
 
@@ -822,6 +825,104 @@ func (s *server) handleToggleCallAgent(w http.ResponseWriter, r *http.Request) {
 		s.broker.emitAgentStatus(sid, cid, body.Enabled, "idle")
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"callId": cid, "agentEnabled": body.Enabled})
+}
+
+func (s *server) requireAPIKey(w http.ResponseWriter, r *http.Request) bool {
+	expected := strings.TrimSpace(os.Getenv("GO_API_KEY"))
+	if expected == "" {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "GO_API_KEY is not configured on server"})
+		return false
+	}
+	provided := strings.TrimSpace(r.Header.Get("X-Api-Key"))
+	if provided == "" {
+		authHeader := strings.TrimSpace(r.Header.Get("Authorization"))
+		if strings.HasPrefix(strings.ToLower(authHeader), "bearer ") {
+			provided = strings.TrimSpace(authHeader[7:])
+		}
+	}
+	if provided == "" || subtle.ConstantTimeCompare([]byte(provided), []byte(expected)) != 1 {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+		return false
+	}
+	return true
+}
+
+func (s *server) handleSessionSendMessage(w http.ResponseWriter, r *http.Request) {
+	if !s.requireAPIKey(w, r) {
+		return
+	}
+	sid := r.PathValue("sid")
+	sess := s.sessionByID(w, sid)
+	if sess == nil {
+		return
+	}
+	if sess.client == nil || sess.client.Store == nil || sess.client.Store.ID == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "session is not paired"})
+		return
+	}
+
+	var body struct {
+		To      string `json:"to"`
+		Text    string `json:"text"`
+		Message string `json:"message"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json body"})
+		return
+	}
+
+	rawTo := strings.TrimSpace(body.To)
+	rawTo = strings.TrimPrefix(rawTo, "LID:")
+	rawTo = strings.TrimSpace(rawTo)
+	text := strings.TrimSpace(body.Text)
+	if text == "" {
+		text = strings.TrimSpace(body.Message)
+	}
+	if rawTo == "" || text == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "to and text are required"})
+		return
+	}
+
+	var peerJID types.JID
+	resolvedPN := ""
+	if sess.mgr != nil && sess.mgr.store != nil {
+		resolvedPN = sess.mgr.store.getPNForLID(r.Context(), rawTo)
+	}
+	if resolvedPN != "" {
+		peerJID = types.NewJID(normalizePhone(resolvedPN), types.DefaultUserServer)
+	} else if strings.Contains(rawTo, "@") {
+		parsed, err := types.ParseJID(rawTo)
+		if err != nil || parsed.User == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid recipient JID"})
+			return
+		}
+		peerJID = parsed.ToNonAD()
+	} else {
+		digits := normalizePhone(rawTo)
+		if digits == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid recipient phone"})
+			return
+		}
+		if sess.mgr != nil && sess.mgr.store != nil {
+			if pn := sess.mgr.store.getPNForLID(r.Context(), digits); pn != "" {
+				digits = normalizePhone(pn)
+			}
+		}
+		peerJID = types.NewJID(digits, types.DefaultUserServer)
+	}
+
+	msgID, err := sess.sendTextSync(r.Context(), peerJID, text)
+	if err != nil {
+		s.log.Error("handleSessionSendMessage failed", "session_id", sid, "to", peerJID.String(), "err", err)
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
+		return
+	}
+	s.log.Info("outbound WhatsApp message sent via API", "session_id", sid, "to", peerJID.String(), "message_id", msgID)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"success":    true,
+		"message_id": msgID,
+		"to":         peerJID.String(),
+	})
 }
 
 

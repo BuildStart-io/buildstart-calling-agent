@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -53,6 +54,25 @@ type CallRecord struct {
 	Summary         string               `json:"summary,omitempty"`
 }
 
+func publicStreamHost() string {
+	if h := strings.TrimSpace(os.Getenv("PUBLIC_HOST")); h != "" {
+		return h
+	}
+	return "localhost:8080"
+}
+
+func isAllDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
 func formatPhoneNumber(jidOrPhone string) string {
 	cleaned := strings.TrimSuffix(jidOrPhone, "@s.whatsapp.net")
 	cleaned = strings.TrimSuffix(cleaned, "@lid")
@@ -60,17 +80,9 @@ func formatPhoneNumber(jidOrPhone string) string {
 		cleaned = cleaned[:idx]
 	}
 	cleaned = strings.TrimPrefix(cleaned, "+")
-	if cleaned == "17609835688032" {
-		cleaned = "94765225044"
-	}
-	if len(cleaned) >= 9 && len(cleaned) <= 15 {
-		if strings.HasPrefix(cleaned, "94") && len(cleaned) == 11 {
-			return fmt.Sprintf("+94 %s %s %s", cleaned[2:4], cleaned[4:7], cleaned[7:])
-		}
-		if strings.HasPrefix(cleaned, "0") && len(cleaned) == 10 {
-			return fmt.Sprintf("+94 %s %s %s", cleaned[1:3], cleaned[3:6], cleaned[6:])
-		}
-		// If 14+ digits not matching regular international prefixes, don't pretend it's a + number
+	cleaned = strings.TrimSpace(cleaned)
+	if isAllDigits(cleaned) && len(cleaned) >= 7 && len(cleaned) <= 15 {
+		// If 14+ digits starting with 1 or 2 (WhatsApp LID range), mark as LID rather than E.164
 		if len(cleaned) >= 14 && (strings.HasPrefix(cleaned, "1") || strings.HasPrefix(cleaned, "2")) {
 			return "LID: " + cleaned
 		}
@@ -226,7 +238,7 @@ func (b *Broker) setCallOutcome(callID, outcome, summary string) {
 
 func (b *Broker) upsertCall(r CallRecord) {
 	b.mu.Lock()
-	if (r.PeerNumber == "" || strings.Contains(r.PeerNumber, "@lid") || strings.Contains(r.PeerNumber, "17609835688032")) && b.store != nil {
+	if (r.PeerNumber == "" || strings.Contains(r.PeerNumber, "@lid") || strings.HasPrefix(r.PeerNumber, "LID:")) && b.store != nil {
 		if resolved := b.store.resolvePhone(r.Peer); resolved != "" {
 			r.PeerNumber = resolved
 		}
@@ -261,7 +273,7 @@ func (b *Broker) upsertCall(r CallRecord) {
 	}
 	b.mu.Unlock()
 	b.broadcastCallList()
-	streamURL := fmt.Sprintf("wss://buildstart-calling-agent.buildstart.io/api/v1/calls/%s/audio", callToSave.CallID)
+	streamURL := fmt.Sprintf("wss://%s/api/v1/calls/%s/audio", publicStreamHost(), callToSave.CallID)
 	b.broadcast(map[string]any{
 		"type": "call-status", "sessionId": r.SessionID, "id": r.CallID, "callId": r.CallID, "call_id": r.CallID, "owner": r.Owner,
 		"status": r.Status, "peer": r.Peer, "peerNumber": r.PeerNumber, "direction": r.Direction,
@@ -362,7 +374,7 @@ func (b *Broker) broadcastCallList() {
 }
 
 func (b *Broker) emitIncoming(sessionID, id, peer string) {
-	streamURL := fmt.Sprintf("wss://buildstart-calling-agent.buildstart.io/api/v1/calls/%s/audio", id)
+	streamURL := fmt.Sprintf("wss://%s/api/v1/calls/%s/audio", publicStreamHost(), id)
 	b.broadcast(map[string]any{
 		"type": "incoming", "sessionId": sessionID, "id": id, "callId": id, "call_id": id,
 		"peer": peer, "offeredAt": time.Now().UnixMilli(),

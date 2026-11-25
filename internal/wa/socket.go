@@ -135,8 +135,5 @@ func (s *Socket) ResolvePNForLID(ctx context.Context, lid types.JID) types.JID {
 			return pn
 		}
 	}
-	if lid.User == "17609835688032" {
-		return types.NewJID("94765225044", types.DefaultUserServer)
-	}
 	return lid
 }

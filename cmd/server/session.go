@@ -66,30 +66,16 @@ func (s *Session) createCall(callID string) *call.CallManager {
 		s.log.Error("failed to load agent config, falling back to disabled", "err", err)
 	} else if os.Getenv("GEMINI_API_KEY") != "" {
 		rawKey := os.Getenv("GEMINI_API_KEY")
-		voice := cfg.VoiceModel
-		if voice == "" || strings.HasPrefix(voice, "dialog-") || strings.HasPrefix(voice, "piper-") || strings.HasPrefix(voice, "models/") || voice == "Kore" {
+		voice := strings.TrimSpace(cfg.VoiceModel)
+		if voice == "" || strings.HasPrefix(voice, "dialog-") || strings.HasPrefix(voice, "piper-") || strings.HasPrefix(voice, "models/") {
 			voice = "Aoede"
 		}
-		model := "models/gemini-3.1-flash-live-preview"
-		
-		basePrompt := `You are a trusted voice sales consultant in Sri Lanka — calm, warm, confident, and genuinely helpful. You are not an FAQ bot, but you never sound pushy, overexcited, theatrical, or aggressive. Guide the call naturally, understand the customer, recommend the right fit, and agree on a useful next step.
+		model := strings.TrimSpace(os.Getenv("GEMINI_LIVE_MODEL"))
+		if model == "" {
+			model = "models/gemini-3.1-flash-live-preview"
+		}
 
-VOICE AND DELIVERY
-Speak at a relaxed, steady pace with a friendly Sri Lankan tone. Use moderate energy and restrained enthusiasm. Keep your pitch and volume even. Do not shout, rush, exaggerate, use hype, or sound like a scripted salesperson. Pause naturally, listen carefully, and acknowledge the customer's answer before asking the next question.
-
-LANGUAGE
-Speak natural Sinhala, Tamil, English, or authentic Singlish and Tanglish code-switching, matching the customer. If they mix languages, mix back naturally. If you did not hear clearly, ask them to repeat — never guess.
-
-HARD RULES
-1. Usually end with one relevant open question or a gentle two-option choice, but do not interrogate.
-2. Keep each spoken sentence under about 20 words and use 1–2 sentences per turn. Use natural connectors sparingly: "හරි", "ඇත්තටම", "නේද?", "சரி".
-3. Never dump feature lists. Give one relevant benefit, then ask.
-
-BUSINESS KNOWLEDGE (STRICTLY ADHERE TO THIS):
-`
-		fullPrompt := basePrompt + cfg.BusinessPrompt
-
-		gl := agent.NewGeminiLiveAgent(rawKey, model, voice, fullPrompt, cfg.GreetingMessage, s.log.With("call_id", callID))
+		gl := agent.NewGeminiLiveAgent(rawKey, model, voice, cfg.BusinessPrompt, cfg.GreetingMessage, s.log.With("call_id", callID))
 		gl.FeedAudio = func(pcm []float32) {
 			ac.PushAudio(pcm)
 		}
@@ -214,7 +200,7 @@ func (s *Session) wireCall(cm *call.CallManager, callID string) {
 				if leadPeer.IsEmpty() {
 					leadPeer, _ = types.ParseJID(c.PeerJid)
 				}
-				s.GenerateAndSendLeadDossier(c.CallID, leadPeer, rec.Transcripts)
+				s.dispatchPostCallWebhook(c.CallID, leadPeer, rec.PeerNumber, rec.Direction, durSec, rec.Transcripts)
 			}
 		} else if c.Direction == core.CallDirectionIncoming {
 			s.mgr.broker.setCallOutcome(c.CallID, "Missed / Unanswered", "Caller hung up before audio connection established.")
@@ -227,8 +213,6 @@ func (s *Session) wireCall(cm *call.CallManager, callID string) {
 				if dialJID.Server == "lid" || dialJID.Server == "" {
 					if pn := s.mgr.store.getPNForLID(context.Background(), dialJID.User); pn != "" {
 						dialJID = types.NewJID(pn, types.DefaultUserServer)
-					} else if dialJID.User == "17609835688032" {
-						dialJID = types.NewJID("94765225044", types.DefaultUserServer)
 					}
 				}
 				resolvedPeerNum := s.mgr.store.resolvePhone(dialJID.User)
@@ -287,8 +271,6 @@ func (s *Session) startOutgoingWithGreeting(ctx context.Context, peer types.JID,
 	}
 	if pn := s.mgr.store.getPNForLID(ctx, peer.User); pn != "" {
 		peer = types.NewJID(pn, types.DefaultUserServer)
-	} else if peer.User == "17609835688032" {
-		peer = types.NewJID("94765225044", types.DefaultUserServer)
 	}
 	peerNum := s.mgr.store.resolvePhone(peer.User)
 	now := time.Now().UnixMilli()
@@ -367,8 +349,6 @@ func (s *Session) onIncomingOffer(ctx context.Context, evt *events.CallOffer) {
 			callbackJID = types.NewJID(pn, types.DefaultUserServer)
 		} else if pn := s.mgr.store.getPNForLID(ctx, evt.From.User); pn != "" {
 			callbackJID = types.NewJID(pn, types.DefaultUserServer)
-		} else if evt.CallCreator.User == "17609835688032" || evt.From.User == "17609835688032" {
-			callbackJID = types.NewJID("94765225044", types.DefaultUserServer)
 		}
 	}
 	if callbackJID.IsEmpty() {
@@ -451,8 +431,6 @@ func (s *Session) handleEvent(rawEvt any) {
 		if peer.Server == "lid" || peer.Server == "" {
 			if pn := s.mgr.store.getPNForLID(ctx, peer.User); pn != "" {
 				peer = types.NewJID(pn, types.DefaultUserServer)
-			} else if peer.User == "17609835688032" {
-				peer = types.NewJID("94765225044", types.DefaultUserServer)
 			}
 		}
 		s.scheduleAutoCallback(peer, "call_offer_notice")
@@ -509,6 +487,9 @@ func (s *Session) handleIncomingMessage(evt *events.Message) {
 }
 
 func (s *Session) scheduleAutoCallback(peer types.JID, reason string) {
+	if strings.EqualFold(strings.TrimSpace(os.Getenv("AUTO_CALLBACK_ENABLED")), "false") {
+		return
+	}
 	if peer.IsEmpty() {
 		return
 	}
@@ -559,11 +540,7 @@ func (s *Session) scheduleAutoCallback(peer types.JID, reason string) {
 			return
 		}
 
-		msgText := agentCfg.FallbackMessage
-		if msgText == "" && reason == "inbound_unanswered_caller_hangup" {
-			msgText = "ආයුබෝවන්! ඔබ අප අමතන්නට උත්සාහ කළ බව දුටුවෙමි. අපගේ AI හඬ සහායකයා මේ මොහොතේම ඔබව නැවත අමතනු ඇත."
-		}
-		if msgText != "" {
+		if msgText := strings.TrimSpace(agentCfg.FallbackMessage); msgText != "" {
 			s.sendWhatsAppMessage(peer, msgText)
 		}
 
@@ -576,12 +553,7 @@ func (s *Session) scheduleAutoCallback(peer types.JID, reason string) {
 			return
 		}
 
-		callbackGreeting := "ආයුබෝවන්! ඔබ මීට සුළු මොහොතකට පෙර අප අමතන්නට උත්සාහ කළ බව දුටුවෙමි. මම ඔබගේ AI හඬ සහායකයා. ඔබට අද මම කොහොමද උදවු කරන්නේ?"
-		if strings.HasPrefix(agentCfg.VoiceModel, "en-") {
-			callbackGreeting = "Hello! I saw that you just tried calling our WhatsApp line. I am your AI voice assistant. How can I help you today?"
-		}
-
-		callID, err := s.startOutgoingWithGreeting(ctx, peer, false, callbackGreeting)
+		callID, err := s.startOutgoingWithGreeting(ctx, peer, false, "auto_callback")
 		if err != nil {
 			s.log.Error("failed to start auto-callback", "peer", peerStr, "err", err)
 			return
@@ -749,25 +721,38 @@ func mapStatus(state core.CallState) CallStatus {
 	}
 }
 
-func (s *Session) sendWhatsAppMessage(to types.JID, text string) {
-	if s.client == nil || text == "" {
-		return
+func (s *Session) sendTextSync(ctx context.Context, to types.JID, text string) (string, error) {
+	if s.client == nil {
+		return "", fmt.Errorf("whatsapp client is nil")
+	}
+	if text == "" {
+		return "", fmt.Errorf("message text is empty")
 	}
 	target := to.ToNonAD()
 	if target.Server == "" {
 		target.Server = types.DefaultUserServer
 	}
+	msg := &waE2E.Message{
+		Conversation: &text,
+	}
+	resp, err := s.client.SendMessage(ctx, target, msg)
+	if err != nil {
+		return "", err
+	}
+	return resp.ID, nil
+}
+
+func (s *Session) sendWhatsAppMessage(to types.JID, text string) {
+	if s.client == nil || text == "" {
+		return
+	}
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
-		msg := &waE2E.Message{
-			Conversation: &text,
-		}
-		_, err := s.client.SendMessage(ctx, target, msg)
-		if err != nil {
-			s.log.Error("failed to send WhatsApp auto-message", "to", target.String(), "err", err)
+		if _, err := s.sendTextSync(ctx, to, text); err != nil {
+			s.log.Error("failed to send WhatsApp auto-message", "to", to.ToNonAD().String(), "err", err)
 		} else {
-			s.log.Info("WhatsApp auto-message sent to caller", "to", target.String(), "text", text)
+			s.log.Info("WhatsApp auto-message sent to caller", "to", to.ToNonAD().String(), "text", text)
 		}
 	}()
 }

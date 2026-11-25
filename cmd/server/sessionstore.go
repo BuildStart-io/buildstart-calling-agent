@@ -119,15 +119,11 @@ func (s *sessionStore) resolvePhone(raw string) string {
 		return formatPhoneNumber(pn)
 	}
 
-	if cleaned == "17609835688032" {
-		return formatPhoneNumber("94765225044")
-	}
-
 	return formatPhoneNumber(cleaned)
 }
 
 func (s *sessionStore) saveCallRecord(ctx context.Context, r CallRecord, businessID string) error {
-	if r.PeerNumber == "" || strings.Contains(r.PeerNumber, "@lid") || strings.HasPrefix(r.PeerNumber, "+17609835688032") {
+	if r.PeerNumber == "" || strings.Contains(r.PeerNumber, "@lid") || strings.HasPrefix(r.PeerNumber, "LID:") {
 		r.PeerNumber = s.resolvePhone(r.Peer)
 	} else {
 		r.PeerNumber = s.resolvePhone(r.PeerNumber)
