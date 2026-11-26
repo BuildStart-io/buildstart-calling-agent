@@ -53,11 +53,8 @@ func main() {
 	loadEnvFile(".env")
 
 	addr := flag.String("addr", ":8080", "HTTP listen address")
-	defaultDB := os.Getenv("DATABASE_URL")
-	if defaultDB == "" {
-		defaultDB = ""
-	}
-	dbPath := flag.String("db", defaultDB, "PostgreSQL connection string")
+	defaultDB := strings.TrimSpace(os.Getenv("DATABASE_URL"))
+	dbPath := flag.String("db", defaultDB, "PostgreSQL connection string (or set DATABASE_URL)")
 	staticDir := flag.String("static", "client/dist", "static client directory (optional)")
 	debug := flag.Bool("debug", false, "verbose logging")
 	maxCalls := flag.Int("max-calls-per-session", 8, "max concurrent calls per session (0 = unlimited)")
@@ -72,6 +69,11 @@ func main() {
 	}
 	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
 	slog.SetDefault(log)
+
+	if strings.TrimSpace(*dbPath) == "" {
+		log.Error("startup failed: DATABASE_URL environment variable or -db flag is required")
+		os.Exit(1)
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
