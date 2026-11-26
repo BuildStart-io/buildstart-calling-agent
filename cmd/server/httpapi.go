@@ -1,9 +1,9 @@
 package main
 
 import (
-	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -41,10 +41,18 @@ func (s *server) routes() http.Handler {
 	mux.HandleFunc("POST /api/v1/sessions/{sid}/logout", s.handleSessionLogout)
 	mux.HandleFunc("POST /api/sessions/{sid}/pair", s.handleSessionPair)
 	mux.HandleFunc("POST /api/v1/sessions/{sid}/pair", s.handleSessionPair)
+
+	// Messaging, Media, Presence & Read Receipts
 	mux.HandleFunc("POST /api/sessions/{sid}/messages/send", s.handleSessionSendMessage)
 	mux.HandleFunc("POST /api/v1/sessions/{sid}/messages/send", s.handleSessionSendMessage)
+	mux.HandleFunc("GET /api/sessions/{sid}/messages/{id}/media", s.handleSessionDownloadMedia)
+	mux.HandleFunc("GET /api/v1/sessions/{sid}/messages/{id}/media", s.handleSessionDownloadMedia)
+	mux.HandleFunc("POST /api/sessions/{sid}/presence", s.handleSessionPresence)
+	mux.HandleFunc("POST /api/v1/sessions/{sid}/presence", s.handleSessionPresence)
+	mux.HandleFunc("POST /api/sessions/{sid}/messages/{id}/read", s.handleSessionMarkRead)
+	mux.HandleFunc("POST /api/v1/sessions/{sid}/messages/{id}/read", s.handleSessionMarkRead)
 
-	// Direct Call Dialing & Listing (no sid needed - uses default connected session)
+	// Call Dialing & Listing (session_id required on /calls/dial for tenant isolation)
 	mux.HandleFunc("GET /api/calls", s.handleCallsList)
 	mux.HandleFunc("GET /api/v1/calls", s.handleCallsList)
 	mux.HandleFunc("GET /api/calls/{id}", s.handleCallGet)
@@ -54,6 +62,10 @@ func (s *server) routes() http.Handler {
 	mux.HandleFunc("POST /api/calls", s.handleDirectDial)
 	mux.HandleFunc("POST /api/v1/calls", s.handleDirectDial)
 	mux.HandleFunc("POST /api/sessions/{sid}/calls", s.handleStartCall)
+
+	// Recordings (Private bucket streaming / presigned access)
+	mux.HandleFunc("GET /api/sessions/{sid}/calls/{id}/recording", s.handleSessionGetRecording)
+	mux.HandleFunc("GET /api/v1/sessions/{sid}/calls/{id}/recording", s.handleSessionGetRecording)
 
 	// Direct WebRTC & WebSocket Audio Streaming
 	mux.HandleFunc("POST /api/calls/{id}/webrtc", s.handleDirectWebRTC)
@@ -85,7 +97,13 @@ func (s *server) routes() http.Handler {
 	mux.HandleFunc("GET /api/v1/history", s.handleDirectHistory)
 	mux.HandleFunc("GET /api/sessions/{sid}/history", s.handleHistory)
 
-	// Agent Config
+	// Agent Configs
+	mux.HandleFunc("PUT /api/agent-configs/{business_id}", s.handlePutAgentConfig)
+	mux.HandleFunc("PUT /api/v1/agent-configs/{business_id}", s.handlePutAgentConfig)
+	mux.HandleFunc("GET /api/agent-configs/{business_id}", s.handleGetAgentConfig)
+	mux.HandleFunc("GET /api/v1/agent-configs/{business_id}", s.handleGetAgentConfig)
+	mux.HandleFunc("DELETE /api/agent-configs/{business_id}", s.handleDeleteAgentConfig)
+	mux.HandleFunc("DELETE /api/v1/agent-configs/{business_id}", s.handleDeleteAgentConfig)
 
 	mux.HandleFunc("POST /api/sessions/{sid}/calls/{id}/agent", s.handleToggleCallAgent)
 
@@ -93,12 +111,12 @@ func (s *server) routes() http.Handler {
 	mux.HandleFunc("GET /api/events", s.handleEvents)
 	mux.HandleFunc("GET /api/v1/events", s.handleEvents)
 
-	if s.staticDir != "" {
+	if strings.EqualFold(strings.TrimSpace(os.Getenv("SERVE_STATIC_CONSOLE")), "true") && s.staticDir != "" {
 		if _, err := os.Stat(s.staticDir); err == nil {
 			mux.Handle("/", http.FileServer(http.Dir(s.staticDir)))
 		}
 	}
-	return s.withCORS(mux)
+	return s.withCORS(s.withPlatformAuth(mux))
 }
 
 func (s *server) withCORS(h http.Handler) http.Handler {
@@ -131,23 +149,12 @@ func clientID(r *http.Request) string {
 	return r.URL.Query().Get("session_id")
 }
 
-func (s *server) defaultSession() *Session {
-	infos := s.sessions.infos()
-	for _, info := range infos {
-		if sess, ok := s.sessions.Get(info.ID); ok && sess.client != nil && sess.client.IsConnected() {
-			return sess
-		}
-	}
-	if len(infos) > 0 {
-		if sess, ok := s.sessions.Get(infos[0].ID); ok {
-			return sess
-		}
-	}
-	return nil
-}
-
-func (s *server) findCall(callID string) (*Session, *activeCall) {
+func (s *server) findCall(r *http.Request, callID string) (*Session, *activeCall) {
+	plat := callerPlatform(r)
 	for _, sess := range s.sessions.allSessions() {
+		if plat != "" && sess.platform != plat {
+			continue
+		}
 		if ac, ok := sess.reg.get(callID); ok {
 			return sess, ac
 		}
@@ -155,8 +162,8 @@ func (s *server) findCall(callID string) (*Session, *activeCall) {
 	return nil, nil
 }
 
-func (s *server) sessionByID(w http.ResponseWriter, sid string) *Session {
-	sess, ok := s.sessions.Get(sid)
+func (s *server) sessionByID(w http.ResponseWriter, r *http.Request, sid string) *Session {
+	sess, ok := s.sessions.GetForPlatform(sid, callerPlatform(r))
 	if !ok {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "no such session"})
 		return nil
@@ -165,30 +172,41 @@ func (s *server) sessionByID(w http.ResponseWriter, sid string) *Session {
 }
 
 func (s *server) handleHealth(w http.ResponseWriter, r *http.Request) {
-	infos := s.sessions.infos()
+	plat := callerPlatform(r)
+	var infos []SessionInfo
+	if plat != "" {
+		infos = s.sessions.infosForPlatform(plat, "")
+	} else {
+		infos = s.sessions.infos()
+	}
+
 	connectedSessions := 0
 	var phones []string
 	for _, info := range infos {
-		if info.State == "connected" || info.Paired {
+		if info.State == "connected" || info.State == "open" || info.Paired {
 			connectedSessions++
-			if info.JID != "" {
+			if plat != "" && info.JID != "" {
 				phones = append(phones, info.JID)
 			}
 		}
 	}
 
-	writeJSON(w, http.StatusOK, map[string]any{
+	resp := map[string]any{
 		"status":             "online",
 		"whatsapp_connected": connectedSessions > 0,
 		"sessions_count":     len(infos),
 		"connected_count":    connectedSessions,
-		"phones":             phones,
 		"timestamp":          time.Now().Unix(),
-	})
+	}
+	if plat != "" {
+		resp["platform"] = plat
+		resp["phones"] = phones
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 func (s *server) handleLines(w http.ResponseWriter, r *http.Request) {
-	infos := s.sessions.infos()
+	infos := s.sessions.infosForPlatform(callerPlatform(r), "")
 	type lineItem struct {
 		ID        string `json:"id"`
 		Name      string `json:"name"`
@@ -197,10 +215,11 @@ func (s *server) handleLines(w http.ResponseWriter, r *http.Request) {
 		State     string `json:"state"`
 		Connected bool   `json:"connected"`
 		Paired    bool   `json:"paired"`
+		Platform  string `json:"platform"`
 	}
 	var lines []lineItem
 	for _, info := range infos {
-		connected := info.State == "connected" || info.Paired
+		connected := info.State == "connected" || info.State == "open" || info.Paired
 		status := "disconnected"
 		if connected {
 			status = "ready"
@@ -213,6 +232,7 @@ func (s *server) handleLines(w http.ResponseWriter, r *http.Request) {
 			State:     info.State,
 			Connected: connected,
 			Paired:    info.Paired,
+			Platform:  info.Platform,
 		})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -222,11 +242,23 @@ func (s *server) handleLines(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) handleEvents(w http.ResponseWriter, r *http.Request) {
-	s.broker.serveSSE(w, r, clientID(r))
+	plat := callerPlatform(r)
+	sid := strings.TrimSpace(r.URL.Query().Get("session_id"))
+	bid := strings.TrimSpace(r.URL.Query().Get("business_id"))
+	if sid != "" {
+		if _, ok := s.sessions.GetForPlatform(sid, plat); !ok {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "no such session"})
+			return
+		}
+	}
+	s.broker.serveSSE(w, r, clientID(r), plat, sid, bid)
 }
 
 func (s *server) handleSessionList(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{"sessions": s.sessions.infos()})
+	bid := strings.TrimSpace(r.URL.Query().Get("business_id"))
+	writeJSON(w, http.StatusOK, map[string]any{
+		"sessions": s.sessions.infosForPlatform(callerPlatform(r), bid),
+	})
 }
 
 func (s *server) handleSessionCreate(w http.ResponseWriter, r *http.Request) {
@@ -239,16 +271,35 @@ func (s *server) handleSessionCreate(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "business_id is required"})
 		return
 	}
-	id, err := s.sessions.Create(businessID)
+	if !isValidUUID(businessID) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid business_id uuid"})
+		return
+	}
+	plat := callerPlatform(r)
+	id, reused, err := s.sessions.Create(plat, businessID)
 	if err != nil {
+		if errors.Is(err, errPlatformMismatch) {
+			writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
+			return
+		}
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"id": id})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"id":          id,
+		"session_id":  id,
+		"business_id": businessID,
+		"platform":    plat,
+		"reused":      reused,
+	})
 }
 
 func (s *server) handleSessionDelete(w http.ResponseWriter, r *http.Request) {
-	if err := s.sessions.Delete(r.Context(), r.PathValue("sid")); err != nil {
+	sess := s.sessionByID(w, r, r.PathValue("sid"))
+	if sess == nil {
+		return
+	}
+	if err := s.sessions.Delete(r.Context(), sess.id); err != nil {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
 		return
 	}
@@ -256,7 +307,11 @@ func (s *server) handleSessionDelete(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) handleSessionLogout(w http.ResponseWriter, r *http.Request) {
-	if err := s.sessions.Logout(r.Context(), r.PathValue("sid")); err != nil {
+	sess := s.sessionByID(w, r, r.PathValue("sid"))
+	if sess == nil {
+		return
+	}
+	if err := s.sessions.Logout(r.Context(), sess.id); err != nil {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
 		return
 	}
@@ -264,7 +319,11 @@ func (s *server) handleSessionLogout(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) handleSessionPair(w http.ResponseWriter, r *http.Request) {
-	if err := s.sessions.Pair(r.PathValue("sid")); err != nil {
+	sess := s.sessionByID(w, r, r.PathValue("sid"))
+	if sess == nil {
+		return
+	}
+	if err := s.sessions.Pair(sess.id); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
@@ -272,6 +331,7 @@ func (s *server) handleSessionPair(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) handleCallsList(w http.ResponseWriter, r *http.Request) {
+	plat := callerPlatform(r)
 	s.broker.mu.RLock()
 	var list []map[string]any
 	host := r.Host
@@ -279,12 +339,17 @@ func (s *server) handleCallsList(w http.ResponseWriter, r *http.Request) {
 		host = publicStreamHost()
 	}
 	for _, c := range s.broker.calls {
+		if plat != "" && c.Platform != plat {
+			continue
+		}
 		streamURL := fmt.Sprintf("wss://%s/api/v1/calls/%s/audio", host, c.CallID)
 		list = append(list, map[string]any{
 			"id":         c.CallID,
 			"callId":     c.CallID,
 			"call_id":    c.CallID,
 			"sessionId":  c.SessionID,
+			"businessId": c.BusinessID,
+			"platform":   c.Platform,
 			"status":     c.Status,
 			"peer":       c.Peer,
 			"peerNumber": c.PeerNumber,
@@ -302,9 +367,10 @@ func (s *server) handleCallsList(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) handleCallGet(w http.ResponseWriter, r *http.Request) {
+	plat := callerPlatform(r)
 	callID := r.PathValue("id")
 	c, ok := s.broker.getCall(callID)
-	if !ok || c == nil {
+	if !ok || c == nil || (plat != "" && c.Platform != plat) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "call not found"})
 		return
 	}
@@ -318,6 +384,8 @@ func (s *server) handleCallGet(w http.ResponseWriter, r *http.Request) {
 		"callId":     c.CallID,
 		"call_id":    c.CallID,
 		"sessionId":  c.SessionID,
+		"businessId": c.BusinessID,
+		"platform":   c.Platform,
 		"status":     c.Status,
 		"peer":       c.Peer,
 		"peerNumber": c.PeerNumber,
@@ -362,15 +430,17 @@ func (s *server) handleDirectDial(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var sess *Session
-	if body.SessionID != "" {
-		sess, _ = s.sessions.Get(body.SessionID)
+	sid := strings.TrimSpace(body.SessionID)
+	if sid == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "session_id is required"})
+		return
 	}
+	sess := s.sessionByID(w, r, sid)
 	if sess == nil {
-		sess = s.defaultSession()
+		return
 	}
-	if sess == nil {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "no active whatsapp session available"})
+	if sess.client == nil || sess.client.Store == nil || sess.client.Store.ID == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "whatsapp session is not paired"})
 		return
 	}
 
@@ -390,6 +460,10 @@ func (s *server) handleDirectDial(w http.ResponseWriter, r *http.Request) {
 	} else if pn := sess.mgr.store.getPNForLID(r.Context(), rawPhone); pn != "" {
 		phone = pn
 	}
+	if phone == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid recipient phone"})
+		return
+	}
 	peer := types.NewJID(phone, types.DefaultUserServer)
 
 	var callID string
@@ -406,7 +480,8 @@ func (s *server) handleDirectDial(w http.ResponseWriter, r *http.Request) {
 
 	peerNum := sess.mgr.store.resolvePhone(peer.User)
 	s.broker.upsertCall(CallRecord{
-		SessionID: sess.id, BusinessID: sess.businessID, CallID: callID, Owner: &owner, Direction: "outbound", Peer: peer.String(),
+		SessionID: sess.id, BusinessID: sess.businessID, Platform: sess.platform, CallID: callID,
+		Owner: &owner, Direction: "outbound", Peer: peer.String(),
 		PeerNumber: peerNum, StartedAt: time.Now().UnixMilli(), Status: StatusRinging,
 	})
 
@@ -434,14 +509,14 @@ func (s *server) handleDirectDial(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) handleStartCall(w http.ResponseWriter, r *http.Request) {
-	if sess := s.sessionByID(w, r.PathValue("sid")); sess != nil {
+	if sess := s.sessionByID(w, r, r.PathValue("sid")); sess != nil {
 		s.doStartCall(sess, w, r)
 	}
 }
 
 func (s *server) handleDirectWebRTC(w http.ResponseWriter, r *http.Request) {
 	callID := r.PathValue("id")
-	sess, _ := s.findCall(callID)
+	sess, _ := s.findCall(r, callID)
 	if sess == nil {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "no such call"})
 		return
@@ -450,20 +525,19 @@ func (s *server) handleDirectWebRTC(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) handleWebRTC(w http.ResponseWriter, r *http.Request) {
-	if sess := s.sessionByID(w, r.PathValue("sid")); sess != nil {
+	if sess := s.sessionByID(w, r, r.PathValue("sid")); sess != nil {
 		s.doWebRTC(sess, w, r)
 	}
 }
 
 func (s *server) handleDirectAudioWS(w http.ResponseWriter, r *http.Request) {
 	callID := r.PathValue("id")
-	sess, ac := s.findCall(callID)
+	sess, ac := s.findCall(r, callID)
 	if sess == nil || ac == nil {
 		http.Error(w, "call not found", http.StatusNotFound)
 		return
 	}
 
-	// Silences any local AI agent so only Lovable handles audio
 	if ac.geminiLive != nil {
 		ac.geminiLive.SetEnabled(false)
 	}
@@ -485,7 +559,6 @@ func (s *server) handleDirectAudioWS(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	audioChan := make(chan []byte, 100)
 	removeListener := ac.addAudioListener(func(pcm []float32) {
-		// WhatsApp caller audio to Gemini Live input is ALWAYS 16 kHz PCM
 		data := media.PCMFloat32ToInt16LE(pcm)
 		select {
 		case audioChan <- data:
@@ -586,7 +659,7 @@ func (s *server) handleDirectAudioWS(w http.ResponseWriter, r *http.Request) {
 
 func (s *server) handleDirectAccept(w http.ResponseWriter, r *http.Request) {
 	callID := r.PathValue("id")
-	sess, _ := s.findCall(callID)
+	sess, _ := s.findCall(r, callID)
 	if sess == nil {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "no such call"})
 		return
@@ -595,14 +668,14 @@ func (s *server) handleDirectAccept(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) handleAccept(w http.ResponseWriter, r *http.Request) {
-	if sess := s.sessionByID(w, r.PathValue("sid")); sess != nil {
+	if sess := s.sessionByID(w, r, r.PathValue("sid")); sess != nil {
 		s.doAccept(sess, w, r)
 	}
 }
 
 func (s *server) handleDirectReject(w http.ResponseWriter, r *http.Request) {
 	callID := r.PathValue("id")
-	sess, _ := s.findCall(callID)
+	sess, _ := s.findCall(r, callID)
 	if sess == nil {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 		return
@@ -611,14 +684,14 @@ func (s *server) handleDirectReject(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) handleReject(w http.ResponseWriter, r *http.Request) {
-	if sess := s.sessionByID(w, r.PathValue("sid")); sess != nil {
+	if sess := s.sessionByID(w, r, r.PathValue("sid")); sess != nil {
 		s.doReject(sess, w, r)
 	}
 }
 
 func (s *server) handleDirectHangup(w http.ResponseWriter, r *http.Request) {
 	callID := r.PathValue("id")
-	sess, _ := s.findCall(callID)
+	sess, _ := s.findCall(r, callID)
 	if sess == nil {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ended"})
 		return
@@ -627,18 +700,18 @@ func (s *server) handleDirectHangup(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) handleEndCall(w http.ResponseWriter, r *http.Request) {
-	if sess := s.sessionByID(w, r.PathValue("sid")); sess != nil {
+	if sess := s.sessionByID(w, r, r.PathValue("sid")); sess != nil {
 		s.doEndCall(sess, w, r)
 	}
 }
 
 func (s *server) handleDirectHistory(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{"rows": s.broker.historyRows("", 50)})
+	writeJSON(w, http.StatusOK, map[string]any{"rows": s.broker.historyRows(callerPlatform(r), "", 50)})
 }
 
 func (s *server) handleHistory(w http.ResponseWriter, r *http.Request) {
-	if sess := s.sessionByID(w, r.PathValue("sid")); sess != nil {
-		writeJSON(w, http.StatusOK, map[string]any{"rows": s.broker.historyRows(sess.id, 50)})
+	if sess := s.sessionByID(w, r, r.PathValue("sid")); sess != nil {
+		writeJSON(w, http.StatusOK, map[string]any{"rows": s.broker.historyRows(sess.platform, sess.id, 50)})
 	}
 }
 
@@ -681,6 +754,10 @@ func (s *server) doStartCall(sess *Session, w http.ResponseWriter, r *http.Reque
 	} else if pn := sess.mgr.store.getPNForLID(r.Context(), rawPhone); pn != "" {
 		phone = pn
 	}
+	if phone == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid recipient phone"})
+		return
+	}
 	peer := types.NewJID(phone, types.DefaultUserServer)
 
 	callID, err := sess.startOutgoing(r.Context(), peer, false)
@@ -689,7 +766,8 @@ func (s *server) doStartCall(sess *Session, w http.ResponseWriter, r *http.Reque
 		return
 	}
 	s.broker.upsertCall(CallRecord{
-		SessionID: sess.id, BusinessID: sess.businessID, CallID: callID, Owner: &owner, Direction: "outbound", Peer: peer.String(),
+		SessionID: sess.id, BusinessID: sess.businessID, Platform: sess.platform, CallID: callID,
+		Owner: &owner, Direction: "outbound", Peer: peer.String(),
 		StartedAt: time.Now().UnixMilli(), Status: StatusRinging,
 	})
 	host := r.Host
@@ -763,7 +841,7 @@ func (s *server) doAccept(sess *Session, w http.ResponseWriter, r *http.Request)
 		writeJSON(w, http.StatusConflict, map[string]string{"error": "claimed by another client"})
 		return
 	}
-	s.broker.emitIncomingClaimed(sess.id, id, owner)
+	s.broker.emitIncomingClaimed(sess.platform, sess.id, sess.businessID, id, owner)
 	if err := ac.cm.AcceptCall(r.Context(), id); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
@@ -803,11 +881,10 @@ func normalizePhone(p string) string {
 	return b.String()
 }
 
-
 func (s *server) handleToggleCallAgent(w http.ResponseWriter, r *http.Request) {
 	sid := r.PathValue("sid")
 	cid := r.PathValue("id")
-	sess := s.sessionByID(w, sid)
+	sess := s.sessionByID(w, r, sid)
 	if sess == nil {
 		return
 	}
@@ -822,37 +899,14 @@ func (s *server) handleToggleCallAgent(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewDecoder(r.Body).Decode(&body)
 	if ac.geminiLive != nil {
 		ac.geminiLive.SetEnabled(body.Enabled)
-		s.broker.emitAgentStatus(sid, cid, body.Enabled, "idle")
+		s.broker.emitAgentStatus(sess.platform, sid, sess.businessID, cid, body.Enabled, "idle")
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"callId": cid, "agentEnabled": body.Enabled})
 }
 
-func (s *server) requireAPIKey(w http.ResponseWriter, r *http.Request) bool {
-	expected := strings.TrimSpace(os.Getenv("GO_API_KEY"))
-	if expected == "" {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "GO_API_KEY is not configured on server"})
-		return false
-	}
-	provided := strings.TrimSpace(r.Header.Get("X-Api-Key"))
-	if provided == "" {
-		authHeader := strings.TrimSpace(r.Header.Get("Authorization"))
-		if strings.HasPrefix(strings.ToLower(authHeader), "bearer ") {
-			provided = strings.TrimSpace(authHeader[7:])
-		}
-	}
-	if provided == "" || subtle.ConstantTimeCompare([]byte(provided), []byte(expected)) != 1 {
-		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
-		return false
-	}
-	return true
-}
-
 func (s *server) handleSessionSendMessage(w http.ResponseWriter, r *http.Request) {
-	if !s.requireAPIKey(w, r) {
-		return
-	}
 	sid := r.PathValue("sid")
-	sess := s.sessionByID(w, sid)
+	sess := s.sessionByID(w, r, sid)
 	if sess == nil {
 		return
 	}
@@ -862,24 +916,36 @@ func (s *server) handleSessionSendMessage(w http.ResponseWriter, r *http.Request
 	}
 
 	var body struct {
-		To      string `json:"to"`
-		Text    string `json:"text"`
-		Message string `json:"message"`
+		To        string `json:"to"`
+		Text      string `json:"text"`
+		Message   string `json:"message"`
+		MediaURL  string `json:"media_url"`
+		MediaType string `json:"media_type"`
+		Caption   string `json:"caption"`
+		Filename  string `json:"filename"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json body"})
 		return
 	}
 
-	rawTo := strings.TrimSpace(body.To)
-	rawTo = strings.TrimPrefix(rawTo, "LID:")
-	rawTo = strings.TrimSpace(rawTo)
+	rawTo := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(body.To), "LID:"))
 	text := strings.TrimSpace(body.Text)
 	if text == "" {
 		text = strings.TrimSpace(body.Message)
 	}
-	if rawTo == "" || text == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "to and text are required"})
+	mediaURL := strings.TrimSpace(body.MediaURL)
+	caption := strings.TrimSpace(body.Caption)
+	if caption == "" {
+		caption = text
+	}
+
+	if rawTo == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "to is required"})
+		return
+	}
+	if text == "" && mediaURL == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "text or media_url is required"})
 		return
 	}
 
@@ -891,12 +957,12 @@ func (s *server) handleSessionSendMessage(w http.ResponseWriter, r *http.Request
 	if resolvedPN != "" {
 		peerJID = types.NewJID(normalizePhone(resolvedPN), types.DefaultUserServer)
 	} else if strings.Contains(rawTo, "@") {
-		parsed, err := types.ParseJID(rawTo)
-		if err != nil || parsed.User == "" {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid recipient JID"})
+		parsed, err := resolveTargetJID(rawTo)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 			return
 		}
-		peerJID = parsed.ToNonAD()
+		peerJID = parsed
 	} else {
 		digits := normalizePhone(rawTo)
 		if digits == "" {
@@ -911,18 +977,29 @@ func (s *server) handleSessionSendMessage(w http.ResponseWriter, r *http.Request
 		peerJID = types.NewJID(digits, types.DefaultUserServer)
 	}
 
-	msgID, err := sess.sendTextSync(r.Context(), peerJID, text)
+	var msgID string
+	var err error
+	if mediaURL != "" {
+		msgID, err = sess.sendMediaURLSync(r.Context(), peerJID, mediaURL, body.MediaType, caption, body.Filename)
+	} else {
+		msgID, err = sess.sendTextSync(r.Context(), peerJID, text)
+	}
 	if err != nil {
 		s.log.Error("handleSessionSendMessage failed", "session_id", sid, "to", peerJID.String(), "err", err)
-		writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
+		statusCode := http.StatusBadGateway
+		msg := err.Error()
+		if strings.Contains(msg, "must use https") || strings.Contains(msg, "blocked ") || strings.Contains(msg, "unsupported media_type") || strings.Contains(msg, "invalid media_url") || strings.Contains(msg, "exceeds") {
+			statusCode = http.StatusBadRequest
+		}
+		writeJSON(w, statusCode, map[string]string{"error": msg})
 		return
 	}
-	s.log.Info("outbound WhatsApp message sent via API", "session_id", sid, "to", peerJID.String(), "message_id", msgID)
+
+	s.log.Info("outbound WhatsApp message sent via API", "session_id", sid, "to", peerJID.String(), "message_id", msgID, "media", mediaURL != "")
 	writeJSON(w, http.StatusOK, map[string]any{
 		"success":    true,
+		"ok":         true,
 		"message_id": msgID,
 		"to":         peerJID.String(),
 	})
 }
-
-

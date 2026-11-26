@@ -29,13 +29,14 @@ type CallEventLog struct {
 
 type CallTranscriptItem struct {
 	Timestamp int64  `json:"timestamp"`
-	Role      string `json:"role"` // "caller" | "agent"
+	Role      string `json:"role"` // "user" | "assistant" | "caller" | "agent"
 	Text      string `json:"text"`
 }
 
 type CallRecord struct {
 	SessionID       string               `json:"sessionId"`
 	BusinessID      string               `json:"businessId"`
+	Platform        string               `json:"platform,omitempty"`
 	CallID          string               `json:"callId"`
 	Owner           *string              `json:"owner"`
 	Direction       string               `json:"direction"` // "inbound", "outbound", "auto-callback"
@@ -82,7 +83,6 @@ func formatPhoneNumber(jidOrPhone string) string {
 	cleaned = strings.TrimPrefix(cleaned, "+")
 	cleaned = strings.TrimSpace(cleaned)
 	if isAllDigits(cleaned) && len(cleaned) >= 7 && len(cleaned) <= 15 {
-		// If 14+ digits starting with 1 or 2 (WhatsApp LID range), mark as LID rather than E.164
 		if len(cleaned) >= 14 && (strings.HasPrefix(cleaned, "1") || strings.HasPrefix(cleaned, "2")) {
 			return "LID: " + cleaned
 		}
@@ -100,6 +100,7 @@ type AuthSnapshot struct {
 type SessionInfo struct {
 	ID         string `json:"id"`
 	BusinessID string `json:"business_id"`
+	Platform   string `json:"platform,omitempty"`
 	JID        string `json:"jid"`
 	State      string `json:"state"`
 	Paired     bool   `json:"paired"`
@@ -107,8 +108,11 @@ type SessionInfo struct {
 }
 
 type subscriber struct {
-	clientID string
-	ch       chan []byte
+	clientID   string
+	platform   string
+	sessionID  string
+	businessID string
+	ch         chan []byte
 }
 
 type Broker struct {
@@ -118,7 +122,7 @@ type Broker struct {
 	history []CallRecord
 	store   *sessionStore
 
-	SnapshotFn func() []any
+	SnapshotFn func(platform, sessionID, businessID string) []any
 }
 
 func NewBroker() *Broker {
@@ -132,15 +136,21 @@ func (b *Broker) setStore(s *sessionStore) {
 	b.mu.Lock()
 	b.store = s
 	if s != nil {
-		if rows, err := s.listCallHistory(context.Background(), "", 100); err == nil {
+		if rows, err := s.listCallHistory(context.Background(), "", "", 100); err == nil {
 			b.history = rows
 		}
 	}
 	b.mu.Unlock()
 }
 
-func (b *Broker) subscribe(clientID string) *subscriber {
-	s := &subscriber{clientID: clientID, ch: make(chan []byte, 32)}
+func (b *Broker) subscribe(clientID, platform, sessionID, businessID string) *subscriber {
+	s := &subscriber{
+		clientID:   clientID,
+		platform:   platform,
+		sessionID:  sessionID,
+		businessID: businessID,
+		ch:         make(chan []byte, 32),
+	}
 	b.mu.Lock()
 	b.subs[s] = struct{}{}
 	b.mu.Unlock()
@@ -154,7 +164,7 @@ func (b *Broker) unsubscribe(s *subscriber) {
 	close(s.ch)
 }
 
-func (b *Broker) broadcast(ev any) {
+func (b *Broker) broadcastScoped(platform, sessionID, businessID string, ev any) {
 	data, err := json.Marshal(ev)
 	if err != nil {
 		return
@@ -162,6 +172,15 @@ func (b *Broker) broadcast(ev any) {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 	for s := range b.subs {
+		if platform != "" && s.platform != platform {
+			continue
+		}
+		if s.sessionID != "" && sessionID != "" && s.sessionID != sessionID {
+			continue
+		}
+		if s.businessID != "" && businessID != "" && s.businessID != businessID {
+			continue
+		}
 		select {
 		case s.ch <- data:
 		default:
@@ -169,28 +188,34 @@ func (b *Broker) broadcast(ev any) {
 	}
 }
 
-func (b *Broker) emitAuthState(sessionID string, a AuthSnapshot) {
-	// New format
-	b.broadcast(map[string]any{
-		"type": "auth-state", "sessionId": sessionID,
+func (b *Broker) emitAuthState(platform, sessionID, businessID string, a AuthSnapshot) {
+	b.broadcastScoped(platform, sessionID, businessID, map[string]any{
+		"type": "auth-state", "sessionId": sessionID, "businessId": businessID,
 		"paired": a.Paired, "state": a.State, "qr": a.QR,
 	})
-	// Backward compatible format
-	b.broadcast(map[string]any{
-		"type": "state", "sessionId": sessionID,
+	b.broadcastScoped(platform, sessionID, businessID, map[string]any{
+		"type": "state", "sessionId": sessionID, "businessId": businessID,
 		"paired": a.Paired, "state": a.State, "qr": a.QR,
 	})
 }
 
-func (b *Broker) emitSessionList(sessions []SessionInfo) {
-	b.broadcast(map[string]any{"type": "session-list", "sessions": sessions})
+func (b *Broker) emitSessionListForPlatform(sessions []SessionInfo) {
+	byPlatform := map[string][]SessionInfo{}
+	for _, s := range sessions {
+		p := s.Platform
+		if p == "" {
+			p = "local"
+		}
+		byPlatform[p] = append(byPlatform[p], s)
+	}
+	for plat, list := range byPlatform {
+		b.broadcastScoped(plat, "", "", map[string]any{"type": "session-list", "sessions": list})
+	}
 }
 
-func (b *Broker) emitSessionQR(sessionID, qr string) {
-	// New format
-	b.broadcast(map[string]any{"type": "session-qr", "sessionId": sessionID, "qr": qr})
-	// Backward compatible format
-	b.broadcast(map[string]any{"type": "qr", "sessionId": sessionID, "qr": qr})
+func (b *Broker) emitSessionQR(platform, sessionID, businessID, qr string) {
+	b.broadcastScoped(platform, sessionID, businessID, map[string]any{"type": "session-qr", "sessionId": sessionID, "qr": qr})
+	b.broadcastScoped(platform, sessionID, businessID, map[string]any{"type": "qr", "sessionId": sessionID, "qr": qr})
 }
 
 func (b *Broker) recordCallEvent(callID, eventType, message, details string) {
@@ -207,7 +232,11 @@ func (b *Broker) recordCallEvent(callID, eventType, message, details string) {
 	}
 	ts := time.Now().UnixMilli()
 	ev := CallEventLog{Timestamp: ts, Type: eventType, Message: message, Details: details}
+	var plat, sid, bid string
 	if ok && c != nil {
+		plat = c.Platform
+		sid = c.SessionID
+		bid = c.BusinessID
 		c.Events = append(c.Events, ev)
 		if b.store != nil {
 			go b.store.saveCallRecord(context.Background(), *c, c.BusinessID)
@@ -215,9 +244,11 @@ func (b *Broker) recordCallEvent(callID, eventType, message, details string) {
 	}
 	b.mu.Unlock()
 
-	b.broadcast(map[string]any{
-		"type": "call-event", "callId": callID, "eventType": eventType, "message": message, "details": details, "timestamp": ts,
-	})
+	if plat != "" {
+		b.broadcastScoped(plat, sid, bid, map[string]any{
+			"type": "call-event", "callId": callID, "eventType": eventType, "message": message, "details": details, "timestamp": ts,
+		})
+	}
 }
 
 func (b *Broker) setCallOutcome(callID, outcome, summary string) {
@@ -250,35 +281,67 @@ func (b *Broker) upsertCall(r CallRecord) {
 	var callToSave CallRecord
 	existing, ok := b.calls[r.CallID]
 	if ok && existing != nil {
-		if r.Direction != "" { existing.Direction = r.Direction }
-		if r.Peer != "" { existing.Peer = r.Peer }
-		if r.PeerNumber != "" { existing.PeerNumber = r.PeerNumber }
-		if r.Status != "" { existing.Status = r.Status }
-		if r.ConnectedAt != nil { existing.ConnectedAt = r.ConnectedAt }
-		if r.EndedAt != nil { existing.EndedAt = r.EndedAt }
-		if r.DurationSeconds > 0 { existing.DurationSeconds = r.DurationSeconds }
-		if r.EndReason != "" { existing.EndReason = r.EndReason }
-		if r.Outcome != "" { existing.Outcome = r.Outcome }
-		if r.TriggerReason != "" { existing.TriggerReason = r.TriggerReason }
-		if r.Summary != "" { existing.Summary = r.Summary }
+		if r.BusinessID != "" {
+			existing.BusinessID = r.BusinessID
+		}
+		if r.Platform != "" {
+			existing.Platform = r.Platform
+		}
+		if r.Direction != "" {
+			existing.Direction = r.Direction
+		}
+		if r.Peer != "" {
+			existing.Peer = r.Peer
+		}
+		if r.PeerNumber != "" {
+			existing.PeerNumber = r.PeerNumber
+		}
+		if r.Status != "" {
+			existing.Status = r.Status
+		}
+		if r.ConnectedAt != nil {
+			existing.ConnectedAt = r.ConnectedAt
+		}
+		if r.EndedAt != nil {
+			existing.EndedAt = r.EndedAt
+		}
+		if r.DurationSeconds > 0 {
+			existing.DurationSeconds = r.DurationSeconds
+		}
+		if r.EndReason != "" {
+			existing.EndReason = r.EndReason
+		}
+		if r.Outcome != "" {
+			existing.Outcome = r.Outcome
+		}
+		if r.TriggerReason != "" {
+			existing.TriggerReason = r.TriggerReason
+		}
+		if r.Summary != "" {
+			existing.Summary = r.Summary
+		}
 		callToSave = *existing
 	} else {
+		if r.Platform == "" {
+			r.Platform = "local"
+		}
 		cp := r
 		b.calls[r.CallID] = &cp
 		callToSave = cp
 	}
-	
-	if b.store != nil {
+
+	if b.store != nil && callToSave.BusinessID != "" {
 		go b.store.saveCallRecord(context.Background(), callToSave, callToSave.BusinessID)
 	}
 	b.mu.Unlock()
-	b.broadcastCallList()
+
+	b.broadcastCallListForPlatform(callToSave.Platform)
 	streamURL := fmt.Sprintf("wss://%s/api/v1/calls/%s/audio", publicStreamHost(), callToSave.CallID)
-	b.broadcast(map[string]any{
-		"type": "call-status", "sessionId": r.SessionID, "id": r.CallID, "callId": r.CallID, "call_id": r.CallID, "owner": r.Owner,
-		"status": r.Status, "peer": r.Peer, "peerNumber": r.PeerNumber, "direction": r.Direction,
-		"startedAt": r.StartedAt, "outcome": r.Outcome, "triggerReason": r.TriggerReason,
-		"stream_url": streamURL, "streamUrl": streamURL,
+	b.broadcastScoped(callToSave.Platform, callToSave.SessionID, callToSave.BusinessID, map[string]any{
+		"type": "call-status", "sessionId": callToSave.SessionID, "id": callToSave.CallID, "callId": callToSave.CallID, "call_id": callToSave.CallID,
+		"owner": callToSave.Owner, "status": callToSave.Status, "peer": callToSave.Peer, "peerNumber": callToSave.PeerNumber,
+		"direction": callToSave.Direction, "startedAt": callToSave.StartedAt, "outcome": callToSave.Outcome,
+		"triggerReason": callToSave.TriggerReason, "stream_url": streamURL, "streamUrl": streamURL,
 	})
 }
 
@@ -332,9 +395,6 @@ func (b *Broker) endCall(id, reason string) {
 	c, ok := b.calls[id]
 	if !ok {
 		b.mu.Unlock()
-		b.broadcast(map[string]any{
-			"type": "call-ended", "id": id, "callId": id, "reason": reason, "endedAt": time.Now().UnixMilli(),
-		})
 		return
 	}
 	now := time.Now().UnixMilli()
@@ -347,48 +407,59 @@ func (b *Broker) endCall(id, reason string) {
 	ended := *c
 	delete(b.calls, id)
 	b.history = append(b.history, ended)
-	if b.store != nil {
-		go b.store.saveCallRecord(context.Background(), ended, ended.BusinessID)
+	if len(b.history) > 200 {
+		b.history = b.history[len(b.history)-200:]
+	}
+	if b.store != nil && ended.BusinessID != "" {
+		// Synchronous final save guarantees ended status and complete transcripts land cleanly.
+		_ = b.store.saveCallRecord(context.Background(), ended, ended.BusinessID)
 	}
 	owner := c.Owner
 	sessionID := c.SessionID
+	businessID := c.BusinessID
+	plat := c.Platform
 	duration := ended.DurationSeconds
 	outcome := ended.Outcome
 	b.mu.Unlock()
 
-	b.broadcast(map[string]any{
+	b.broadcastScoped(plat, sessionID, businessID, map[string]any{
 		"type": "call-ended", "sessionId": sessionID, "id": id, "callId": id, "owner": owner, "reason": reason, "endedAt": now,
 		"durationSeconds": duration, "outcome": outcome,
 	})
-	b.broadcastCallList()
+	b.broadcastCallListForPlatform(plat)
 }
 
-func (b *Broker) broadcastCallList() {
+func (b *Broker) broadcastCallListForPlatform(platform string) {
 	b.mu.RLock()
 	list := make([]CallRecord, 0, len(b.calls))
 	for _, c := range b.calls {
-		list = append(list, *c)
+		if platform == "" || c.Platform == platform {
+			list = append(list, *c)
+		}
 	}
 	b.mu.RUnlock()
-	b.broadcast(map[string]any{"type": "call-list", "calls": list})
+	b.broadcastScoped(platform, "", "", map[string]any{"type": "call-list", "calls": list})
 }
 
-func (b *Broker) emitIncoming(sessionID, id, peer string) {
+func (b *Broker) emitIncoming(platform, sessionID, businessID, id, peer string) {
 	streamURL := fmt.Sprintf("wss://%s/api/v1/calls/%s/audio", publicStreamHost(), id)
-	b.broadcast(map[string]any{
+	b.broadcastScoped(platform, sessionID, businessID, map[string]any{
 		"type": "incoming", "sessionId": sessionID, "id": id, "callId": id, "call_id": id,
 		"peer": peer, "offeredAt": time.Now().UnixMilli(),
 		"stream_url": streamURL, "streamUrl": streamURL,
 	})
 }
 
-func (b *Broker) emitIncomingClaimed(sessionID, id, owner string) {
-	b.broadcast(map[string]any{"type": "incoming-claimed", "sessionId": sessionID, "id": id, "owner": owner})
+func (b *Broker) emitIncomingClaimed(platform, sessionID, businessID, id, owner string) {
+	b.broadcastScoped(platform, sessionID, businessID, map[string]any{"type": "incoming-claimed", "sessionId": sessionID, "id": id, "owner": owner})
 }
 
 func (b *Broker) emitAgentTranscript(sessionID, callID, role, text string, ts int64) {
 	b.mu.Lock()
+	var plat, bid string
 	if c, ok := b.calls[callID]; ok {
+		plat = c.Platform
+		bid = c.BusinessID
 		c.Transcripts = append(c.Transcripts, CallTranscriptItem{
 			Timestamp: ts,
 			Role:      role,
@@ -399,28 +470,30 @@ func (b *Broker) emitAgentTranscript(sessionID, callID, role, text string, ts in
 			Type:      "speech",
 			Message:   fmt.Sprintf("[%s]: %s", role, text),
 		})
-		if b.store != nil {
+		if b.store != nil && c.BusinessID != "" {
 			go b.store.saveCallRecord(context.Background(), *c, c.BusinessID)
 		}
 	}
 	b.mu.Unlock()
 
-	b.broadcast(map[string]any{
-		"type": "agent-transcript", "sessionId": sessionID, "callId": callID,
-		"role": role, "text": text, "timestamp": ts,
-	})
+	if plat != "" {
+		b.broadcastScoped(plat, sessionID, bid, map[string]any{
+			"type": "agent-transcript", "sessionId": sessionID, "callId": callID,
+			"role": role, "text": text, "timestamp": ts,
+		})
+	}
 }
 
-func (b *Broker) emitAgentStatus(sessionID, callID string, enabled bool, state string) {
-	b.broadcast(map[string]any{
+func (b *Broker) emitAgentStatus(platform, sessionID, businessID, callID string, enabled bool, state string) {
+	b.broadcastScoped(platform, sessionID, businessID, map[string]any{
 		"type": "agent-status", "sessionId": sessionID, "callId": callID,
 		"enabled": enabled, "state": state,
 	})
 }
 
-func (b *Broker) historyRows(sessionID string, limit int) []CallRecord {
+func (b *Broker) historyRows(platform, sessionID string, limit int) []CallRecord {
 	if b.store != nil {
-		if rows, err := b.store.listCallHistory(context.Background(), sessionID, limit); err == nil && len(rows) > 0 {
+		if rows, err := b.store.listCallHistory(context.Background(), platform, sessionID, limit); err == nil && len(rows) > 0 {
 			return rows
 		}
 	}
@@ -428,14 +501,19 @@ func (b *Broker) historyRows(sessionID string, limit int) []CallRecord {
 	defer b.mu.RUnlock()
 	rows := make([]CallRecord, 0, limit)
 	for i := len(b.history) - 1; i >= 0 && len(rows) < limit; i-- {
-		if sessionID == "" || b.history[i].SessionID == sessionID {
-			rows = append(rows, b.history[i])
+		h := b.history[i]
+		if platform != "" && h.Platform != platform {
+			continue
 		}
+		if sessionID != "" && h.SessionID != sessionID {
+			continue
+		}
+		rows = append(rows, h)
 	}
 	return rows
 }
 
-func (b *Broker) serveSSE(w http.ResponseWriter, r *http.Request, clientID string) {
+func (b *Broker) serveSSE(w http.ResponseWriter, r *http.Request, clientID, platform, sessionID, businessID string) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
@@ -448,15 +526,15 @@ func (b *Broker) serveSSE(w http.ResponseWriter, r *http.Request, clientID strin
 	w.Header().Set("X-Accel-Buffering", "no")
 	flusher.Flush()
 
-	sub := b.subscribe(clientID)
+	sub := b.subscribe(clientID, platform, sessionID, businessID)
 	defer b.unsubscribe(sub)
 
 	if b.SnapshotFn != nil {
-		for _, ev := range b.SnapshotFn() {
+		for _, ev := range b.SnapshotFn(platform, sessionID, businessID) {
 			writeSSE(w, flusher, ev)
 		}
 	}
-	b.broadcastCallList()
+	b.broadcastCallListForPlatform(platform)
 
 	keepalive := time.NewTicker(20 * time.Second)
 	defer keepalive.Stop()
@@ -471,7 +549,7 @@ func (b *Broker) serveSSE(w http.ResponseWriter, r *http.Request, clientID strin
 			}
 			flusher.Flush()
 		case <-keepalive.C:
-			w.Write([]byte(": ping\n\n"))
+			_, _ = w.Write([]byte(": ping\n\n"))
 			flusher.Flush()
 		}
 	}
@@ -479,6 +557,6 @@ func (b *Broker) serveSSE(w http.ResponseWriter, r *http.Request, clientID strin
 
 func writeSSE(w http.ResponseWriter, f http.Flusher, ev any) {
 	data, _ := json.Marshal(ev)
-	w.Write(append(append([]byte("data: "), data...), '\n', '\n'))
+	_, _ = w.Write(append(append([]byte("data: "), data...), '\n', '\n'))
 	f.Flush()
 }

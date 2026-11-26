@@ -82,7 +82,7 @@ func ensureTargetPeer(peerJid, callCreator types.JID) types.JID {
 
 func BuildAcceptStanza(ctx context.Context, sock core.VoipSocket, callID string, callKey []byte, peerJid, callCreator types.JID, isVideo bool) (waBinary.Node, error) {
 	target := ensureTargetPeer(peerJid, callCreator)
-	
+
 	rawDevices, err := sock.GetUSyncDevices(ctx, []types.JID{target, callCreator})
 	if err != nil || len(rawDevices) == 0 {
 		rawDevices = []types.JID{target}

@@ -7,136 +7,146 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
-	"path/filepath"
 	"testing"
+
+	waLog "go.mau.fi/whatsmeow/util/log"
 )
 
-func newTestServer(t *testing.T) *server {
+func newMockHTTPServer(t *testing.T) *server {
 	t.Helper()
-	ctx := context.Background()
-	dbPath := filepath.Join(t.TempDir(), "api_test.db")
-	srv, err := newServer(ctx, dbPath, "", 0, nil, slog.Default())
-	if err != nil {
-		t.Fatalf("failed to create test server: %v", err)
+	broker := NewBroker()
+	mgr := newSessionManager(context.Background(), nil, broker, nil, nil, waLog.Noop, slog.Default(), 2)
+	addMockSession(mgr, "sess_local_1", "11111111-1111-1111-1111-111111111111", "local")
+	addMockSession(mgr, "sess_global_1", "22222222-2222-2222-2222-222222222222", "global")
+
+	broker.upsertCall(CallRecord{
+		SessionID:  "sess_local_1",
+		BusinessID: "11111111-1111-1111-1111-111111111111",
+		Platform:   "local",
+		CallID:     "call_local_1",
+		Status:     StatusRinging,
+	})
+	broker.upsertCall(CallRecord{
+		SessionID:  "sess_global_1",
+		BusinessID: "22222222-2222-2222-2222-222222222222",
+		Platform:   "global",
+		CallID:     "call_global_1",
+		Status:     StatusRinging,
+	})
+
+	return &server{
+		broker:   broker,
+		sessions: mgr,
+		apiKeys: map[string]string{
+			"local":  "test-local-secret",
+			"global": "test-global-secret",
+		},
+		log:       slog.Default(),
+		staticDir: "./client/dist",
 	}
-	return srv
 }
 
-func TestHealthEndpoints(t *testing.T) {
-	srv := newTestServer(t)
+func TestPlatformAuthAndHealth(t *testing.T) {
+	srv := newMockHTTPServer(t)
 	handler := srv.routes()
 
-	endpoints := []string{"/health", "/api/health", "/status", "/api/status"}
-	for _, ep := range endpoints {
-		req := httptest.NewRequest("GET", ep, nil)
-		w := httptest.NewRecorder()
+	// Unauthenticated /api/sessions must return 401
+	req := httptest.NewRequest("GET", "/api/sessions", nil)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for unauthenticated /api/sessions, got %d", w.Code)
+	}
+
+	// Public /health succeeds without key and does NOT leak phones
+	for _, ep := range []string{"/health", "/api/health", "/api/v1/health"} {
+		req = httptest.NewRequest("GET", ep, nil)
+		w = httptest.NewRecorder()
 		handler.ServeHTTP(w, req)
-
 		if w.Code != http.StatusOK {
-			t.Errorf("expected 200 for %s, got %d", ep, w.Code)
+			t.Fatalf("expected 200 for %s, got %d", ep, w.Code)
 		}
-
 		var resp map[string]any
 		if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
-			t.Errorf("failed to decode response for %s: %v", ep, err)
+			t.Fatalf("decode %s failed: %v", ep, err)
 		}
-		if status, ok := resp["status"].(string); !ok || status != "online" {
-			t.Errorf("expected status 'online' for %s, got %v", ep, resp["status"])
+		if resp["status"] != "online" {
+			t.Fatalf("expected online status on %s, got %v", ep, resp["status"])
 		}
+		if _, hasPhones := resp["phones"]; hasPhones {
+			t.Fatalf("public %s must not expose phone JIDs", ep)
+		}
+	}
+
+	// Static console disabled by default
+	req = httptest.NewRequest("GET", "/", nil)
+	req.Header.Set("X-Api-Key", "test-local-secret")
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 on / when SERVE_STATIC_CONSOLE unset, got %d", w.Code)
 	}
 }
 
-func TestSessionManagementAPI(t *testing.T) {
-	srv := newTestServer(t)
+func TestCrossPlatformIsolationHTTP(t *testing.T) {
+	srv := newMockHTTPServer(t)
 	handler := srv.routes()
 
-	// 1. Initial sessions list is empty
+	// Global key only sees global sessions and calls
 	req := httptest.NewRequest("GET", "/api/sessions", nil)
+	req.Header.Set("Authorization", "Bearer test-global-secret")
 	w := httptest.NewRecorder()
 	handler.ServeHTTP(w, req)
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d", w.Code)
 	}
-
-	var resp struct {
-		Sessions []any `json:"sessions"`
+	var sResp struct {
+		Sessions []SessionInfo `json:"sessions"`
 	}
-	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
-		t.Fatalf("failed to decode sessions: %v", err)
-	}
-	if len(resp.Sessions) != 0 {
-		t.Fatalf("expected 0 sessions, got %d", len(resp.Sessions))
+	_ = json.NewDecoder(w.Body).Decode(&sResp)
+	if len(sResp.Sessions) != 1 || sResp.Sessions[0].ID != "sess_global_1" {
+		t.Fatalf("global key leaked wrong sessions: %+v", sResp.Sessions)
 	}
 
-	// 2. Create session successfully
-	reqBody := map[string]string{"name": "Test Line"}
-	bodyBytes, _ := json.Marshal(reqBody)
-	req = httptest.NewRequest("POST", "/api/sessions", bytes.NewBuffer(bodyBytes))
-	w = httptest.NewRecorder()
-	handler.ServeHTTP(w, req)
-	if w.Code != http.StatusOK {
-		t.Fatalf("expected 200 for session create, got %d: %s", w.Code, w.Body.String())
-	}
-
-	var created map[string]any
-	if err := json.NewDecoder(w.Body).Decode(&created); err != nil {
-		t.Fatalf("failed to decode created session: %v", err)
-	}
-	sid, ok := created["id"].(string)
-	if !ok || sid == "" {
-		t.Fatalf("expected valid session id, got %v", created["id"])
-	}
-
-	// 3. Delete session
-	req = httptest.NewRequest("DELETE", "/api/sessions/"+sid, nil)
-	w = httptest.NewRecorder()
-	handler.ServeHTTP(w, req)
-	if w.Code != http.StatusNoContent {
-		t.Fatalf("expected 204 for session delete, got %d", w.Code)
+	// Global key trying to use local session or read local call gets 404
+	for _, tc := range []struct {
+		method string
+		path   string
+	}{
+		{"DELETE", "/api/sessions/sess_local_1"},
+		{"POST", "/api/sessions/sess_local_1/messages/send"},
+		{"GET", "/api/calls/call_local_1"},
+	} {
+		req = httptest.NewRequest(tc.method, tc.path, bytes.NewBufferString(`{"to":"123","text":"hi"}`))
+		req.Header.Set("X-Api-Key", "test-global-secret")
+		w = httptest.NewRecorder()
+		handler.ServeHTTP(w, req)
+		if w.Code != http.StatusNotFound {
+			t.Fatalf("%s %s with global key expected 404, got %d", tc.method, tc.path, w.Code)
+		}
 	}
 }
 
-func TestDirectDialEdgeCases(t *testing.T) {
-	srv := newTestServer(t)
+func TestDirectDialRequiresSessionID(t *testing.T) {
+	srv := newMockHTTPServer(t)
 	handler := srv.routes()
 
-	// 1. Malformed JSON
-	req := httptest.NewRequest("POST", "/api/calls/dial", bytes.NewBufferString("{broken json"))
+	payload, _ := json.Marshal(map[string]any{"to": "+94771234567"})
+	req := httptest.NewRequest("POST", "/api/calls/dial", bytes.NewBuffer(payload))
+	req.Header.Set("X-Api-Key", "test-local-secret")
 	w := httptest.NewRecorder()
 	handler.ServeHTTP(w, req)
 	if w.Code != http.StatusBadRequest {
-		t.Errorf("expected 400 for malformed json, got %d", w.Code)
+		t.Fatalf("expected 400 when session_id missing on /api/calls/dial, got %d: %s", w.Code, w.Body.String())
 	}
 
-	// 2. Missing to / recipient field
-	emptyPayload, _ := json.Marshal(map[string]any{"to": ""})
-	req = httptest.NewRequest("POST", "/api/calls/dial", bytes.NewBuffer(emptyPayload))
+	// Non-existent session or wrong-platform session returns 404
+	payload2, _ := json.Marshal(map[string]any{"to": "+94771234567", "session_id": "sess_local_1"})
+	req = httptest.NewRequest("POST", "/api/calls/dial", bytes.NewBuffer(payload2))
+	req.Header.Set("X-Api-Key", "test-global-secret")
 	w = httptest.NewRecorder()
 	handler.ServeHTTP(w, req)
-	if w.Code != http.StatusBadRequest {
-		t.Errorf("expected 400 for empty recipient, got %d", w.Code)
-	}
-
-	// 3. Invalid phone number (letters, symbols)
-	invalidPayload, _ := json.Marshal(map[string]any{"to": "invalid-phone"})
-	req = httptest.NewRequest("POST", "/api/calls/dial", bytes.NewBuffer(invalidPayload))
-	w = httptest.NewRecorder()
-	handler.ServeHTTP(w, req)
-	if w.Code != http.StatusBadRequest && w.Code != http.StatusServiceUnavailable {
-		t.Errorf("expected 400 or 503 for invalid phone, got %d", w.Code)
-	}
-}
-
-func TestCallLookupNotFound(t *testing.T) {
-	srv := newTestServer(t)
-	handler := srv.routes()
-
-	// Non-existent call ID
-	req := httptest.NewRequest("GET", "/api/calls/non_existent_call_id_12345", nil)
-	w := httptest.NewRecorder()
-	handler.ServeHTTP(w, req)
-
 	if w.Code != http.StatusNotFound {
-		t.Errorf("expected 404 for non-existent call, got %d", w.Code)
+		t.Fatalf("expected 404 for cross-platform dial, got %d", w.Code)
 	}
 }

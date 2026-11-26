@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"time"
 )
@@ -14,6 +15,7 @@ type sessionRow struct {
 	ID         string
 	BusinessID string
 	JID        string
+	Platform   string
 }
 
 type sessionStore struct{ db *sql.DB }
@@ -31,12 +33,16 @@ func newSessionStore(ctx context.Context, db *sql.DB) (*sessionStore, error) {
 
 func newSessionID() string {
 	b := make([]byte, 16)
-	rand.Read(b)
+	_, _ = rand.Read(b)
 	return hex.EncodeToString(b)
 }
 
 func (s *sessionStore) list(ctx context.Context) ([]sessionRow, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT session_id, business_id, COALESCE(jid, '') FROM whatsapp_infra.whatsapp_sessions ORDER BY created_at ASC`)
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT session_id, business_id::text, COALESCE(jid, ''), COALESCE(platform, 'local')
+		FROM whatsapp_infra.whatsapp_sessions
+		ORDER BY created_at ASC
+	`)
 	if err != nil {
 		return nil, err
 	}
@@ -44,7 +50,7 @@ func (s *sessionStore) list(ctx context.Context) ([]sessionRow, error) {
 	var out []sessionRow
 	for rows.Next() {
 		var r sessionRow
-		if err := rows.Scan(&r.ID, &r.BusinessID, &r.JID); err != nil {
+		if err := rows.Scan(&r.ID, &r.BusinessID, &r.JID, &r.Platform); err != nil {
 			return nil, err
 		}
 		out = append(out, r)
@@ -52,9 +58,32 @@ func (s *sessionStore) list(ctx context.Context) ([]sessionRow, error) {
 	return out, rows.Err()
 }
 
-func (s *sessionStore) insert(ctx context.Context, id, businessID string) error {
-	_, err := s.db.ExecContext(ctx, `INSERT INTO whatsapp_infra.whatsapp_sessions (session_id, business_id, jid) VALUES ($1, $2, '')`, id, businessID)
+func (s *sessionStore) insert(ctx context.Context, id, businessID, platform string) error {
+	if platform == "" {
+		platform = "local"
+	}
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO whatsapp_infra.whatsapp_sessions (session_id, business_id, jid, platform)
+		VALUES ($1, $2::uuid, '', $3)
+	`, id, businessID, platform)
 	return err
+}
+
+func (s *sessionStore) getSessionPlatformByBusiness(ctx context.Context, businessID string) (string, bool, error) {
+	var plat string
+	err := s.db.QueryRowContext(ctx, `
+		SELECT COALESCE(platform, 'local')
+		FROM whatsapp_infra.whatsapp_sessions
+		WHERE business_id = $1::uuid
+		LIMIT 1
+	`, businessID).Scan(&plat)
+	if err == sql.ErrNoRows {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	return plat, true, nil
 }
 
 func (s *sessionStore) setJID(ctx context.Context, id, jid string) error {
@@ -130,7 +159,10 @@ func (s *sessionStore) saveCallRecord(ctx context.Context, r CallRecord, busines
 	}
 
 	transcriptsJSON, _ := json.Marshal(r.Transcripts)
-	
+	if len(transcriptsJSON) == 0 || string(transcriptsJSON) == "null" {
+		transcriptsJSON = []byte("[]")
+	}
+
 	var startedAt, connectedAt, endedAt sql.NullTime
 	if r.StartedAt > 0 {
 		startedAt = sql.NullTime{Time: time.UnixMilli(r.StartedAt), Valid: true}
@@ -142,20 +174,28 @@ func (s *sessionStore) saveCallRecord(ctx context.Context, r CallRecord, busines
 		endedAt = sql.NullTime{Time: time.UnixMilli(*r.EndedAt), Valid: true}
 	}
 
+	// Monotonic upsert: out-of-order async updates never roll 'ended' backward or shrink transcripts.
 	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO whatsapp_infra.call_logs (
 			call_id, session_id, business_id, caller_number, direction,
 			started_at, connected_at, ended_at, duration,
 			status, transcript_json
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+		) VALUES ($1, $2, $3::uuid, $4, $5, $6, $7, $8, $9, $10, $11::jsonb)
 		ON CONFLICT (call_id) DO UPDATE SET
-			caller_number = EXCLUDED.caller_number,
-			direction = EXCLUDED.direction,
-			connected_at = EXCLUDED.connected_at,
-			ended_at = EXCLUDED.ended_at,
-			duration = EXCLUDED.duration,
-			status = EXCLUDED.status,
-			transcript_json = EXCLUDED.transcript_json
+			caller_number = COALESCE(NULLIF(EXCLUDED.caller_number, ''), whatsapp_infra.call_logs.caller_number),
+			direction = COALESCE(NULLIF(EXCLUDED.direction, ''), whatsapp_infra.call_logs.direction),
+			connected_at = COALESCE(whatsapp_infra.call_logs.connected_at, EXCLUDED.connected_at),
+			ended_at = COALESCE(EXCLUDED.ended_at, whatsapp_infra.call_logs.ended_at),
+			duration = GREATEST(COALESCE(whatsapp_infra.call_logs.duration, 0), COALESCE(EXCLUDED.duration, 0)),
+			status = CASE
+				WHEN whatsapp_infra.call_logs.status = 'ended' THEN 'ended'
+				ELSE EXCLUDED.status
+			END,
+			transcript_json = CASE
+				WHEN jsonb_array_length(COALESCE(EXCLUDED.transcript_json, '[]'::jsonb)) >= jsonb_array_length(COALESCE(whatsapp_infra.call_logs.transcript_json, '[]'::jsonb))
+				THEN EXCLUDED.transcript_json
+				ELSE whatsapp_infra.call_logs.transcript_json
+			END
 	`,
 		r.CallID, r.SessionID, businessID, r.PeerNumber, r.Direction,
 		startedAt, connectedAt, endedAt, r.DurationSeconds,
@@ -173,22 +213,36 @@ func (s *sessionStore) updateCallRecording(ctx context.Context, callID, recordin
 	return err
 }
 
-func (s *sessionStore) listCallHistory(ctx context.Context, sessionID string, limit int) ([]CallRecord, error) {
-	query := `SELECT call_id, session_id, direction, COALESCE(caller_number, ''),
-		started_at, connected_at, ended_at, COALESCE(duration, 0),
-		status, COALESCE(transcript_json, '[]'::jsonb)
-		FROM whatsapp_infra.call_logs`
+func buildListCallHistoryQuery(platform, sessionID string, limit int) (string, []any) {
+	query := `SELECT cl.call_id, cl.session_id, cl.business_id::text, cl.direction, COALESCE(cl.caller_number, ''),
+		cl.started_at, cl.connected_at, cl.ended_at, COALESCE(cl.duration, 0),
+		cl.status, COALESCE(cl.transcript_json, '[]'::jsonb), COALESCE(ws.platform, 'local')
+		FROM whatsapp_infra.call_logs cl
+		LEFT JOIN whatsapp_infra.whatsapp_sessions ws ON ws.session_id = cl.session_id`
+
+	var conds []string
 	var args []any
+	if platform != "" {
+		args = append(args, platform)
+		conds = append(conds, fmt.Sprintf("COALESCE(ws.platform, 'local') = $%d", len(args)))
+	}
 	if sessionID != "" {
-		query += ` WHERE session_id = $1`
 		args = append(args, sessionID)
+		conds = append(conds, fmt.Sprintf("cl.session_id = $%d", len(args)))
 	}
-	query += ` ORDER BY started_at DESC LIMIT $2`
-	if sessionID == "" {
-	    args = append(args, limit)
-	} else {
-	    args = append(args, limit)
+	if len(conds) > 0 {
+		query += " WHERE " + strings.Join(conds, " AND ")
 	}
+	args = append(args, limit)
+	query += fmt.Sprintf(" ORDER BY cl.started_at DESC LIMIT $%d", len(args))
+	return query, args
+}
+
+func (s *sessionStore) listCallHistory(ctx context.Context, platform, sessionID string, limit int) ([]CallRecord, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	query, args := buildListCallHistoryQuery(platform, sessionID, limit)
 
 	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
@@ -203,9 +257,9 @@ func (s *sessionStore) listCallHistory(ctx context.Context, sessionID string, li
 		var startedAt, connectedAt, endedAt sql.NullTime
 
 		if err := rows.Scan(
-			&r.CallID, &r.SessionID, &r.Direction, &r.PeerNumber,
+			&r.CallID, &r.SessionID, &r.BusinessID, &r.Direction, &r.PeerNumber,
 			&startedAt, &connectedAt, &endedAt, &r.DurationSeconds,
-			&statusStr, &transcriptsJSON,
+			&statusStr, &transcriptsJSON, &r.Platform,
 		); err != nil {
 			return nil, err
 		}
@@ -214,11 +268,11 @@ func (s *sessionStore) listCallHistory(ctx context.Context, sessionID string, li
 			r.StartedAt = startedAt.Time.UnixMilli()
 		}
 		if connectedAt.Valid {
-		    unix := connectedAt.Time.UnixMilli()
+			unix := connectedAt.Time.UnixMilli()
 			r.ConnectedAt = &unix
 		}
 		if endedAt.Valid {
-		    unix := endedAt.Time.UnixMilli()
+			unix := endedAt.Time.UnixMilli()
 			r.EndedAt = &unix
 		}
 		_ = json.Unmarshal([]byte(transcriptsJSON), &r.Transcripts)
@@ -227,26 +281,152 @@ func (s *sessionStore) listCallHistory(ctx context.Context, sessionID string, li
 		}
 		out = append(out, r)
 	}
-	_ = rows.Close()
-	return out, nil
+	return out, rows.Err()
 }
 
 type AgentConfigRow struct {
-	BusinessPrompt  string
-	GreetingMessage string
-	FallbackMessage string
-	VoiceModel      string
+	Platform            string
+	BusinessPrompt      string
+	GreetingMessage     string
+	FallbackMessage     string
+	VoiceModel          string
+	VoiceEnabled        bool
+	AutoAnswer          bool
+	AutoCallback        bool
+	HasCallbackKeywords bool
+	CallbackKeywords    []string
+	MaxCallSeconds      int
+	Timezone            string
+	ToolsJSON           []byte
+	UpdatedAt           time.Time
+}
+
+func defaultAgentConfigRow() AgentConfigRow {
+	return AgentConfigRow{
+		Platform:     "local",
+		VoiceEnabled: true,
+		AutoAnswer:   true,
+		AutoCallback: true,
+	}
+}
+
+func (s *sessionStore) getAgentConfigScoped(ctx context.Context, businessID string) (AgentConfigRow, bool, error) {
+	r := defaultAgentConfigRow()
+	var kwRaw, toolsRaw []byte
+	var tz sql.NullString
+	var updatedAt sql.NullTime
+
+	err := s.db.QueryRowContext(ctx, `
+		SELECT COALESCE(platform, 'local'),
+		       COALESCE(business_prompt, ''),
+		       COALESCE(greeting_message, ''),
+		       COALESCE(fallback_message, ''),
+		       COALESCE(voice_model, 'models/gemini-3.1-flash-live-preview'),
+		       COALESCE(voice_enabled, true),
+		       COALESCE(auto_answer, true),
+		       COALESCE(auto_callback, true),
+		       COALESCE(max_call_seconds, 0),
+		       timezone,
+		       callback_keywords,
+		       tools_json,
+		       updated_at
+		FROM whatsapp_infra.agent_configs
+		WHERE business_id = $1::uuid
+	`, businessID).Scan(
+		&r.Platform, &r.BusinessPrompt, &r.GreetingMessage, &r.FallbackMessage, &r.VoiceModel,
+		&r.VoiceEnabled, &r.AutoAnswer, &r.AutoCallback, &r.MaxCallSeconds, &tz, &kwRaw, &toolsRaw, &updatedAt,
+	)
+	if err == sql.ErrNoRows {
+		return r, false, nil
+	}
+	if err != nil {
+		return r, false, err
+	}
+	if tz.Valid {
+		r.Timezone = tz.String
+	}
+	if updatedAt.Valid {
+		r.UpdatedAt = updatedAt.Time
+	}
+	if len(kwRaw) > 0 && string(kwRaw) != "null" {
+		var kws []string
+		if jsonErr := json.Unmarshal(kwRaw, &kws); jsonErr == nil {
+			r.HasCallbackKeywords = true
+			r.CallbackKeywords = kws
+		}
+	}
+	if len(toolsRaw) > 0 && string(toolsRaw) != "null" {
+		r.ToolsJSON = toolsRaw
+	}
+	return r, true, nil
 }
 
 func (s *sessionStore) getAgentConfig(ctx context.Context, businessID string) (AgentConfigRow, error) {
-	var r AgentConfigRow
-	err := s.db.QueryRowContext(ctx, `
-		SELECT COALESCE(business_prompt, ''), COALESCE(greeting_message, ''), COALESCE(fallback_message, ''), COALESCE(voice_model, 'models/gemini-3.1-flash-live-preview')
-		FROM whatsapp_infra.agent_configs
-		WHERE business_id = $1
-	`, businessID).Scan(&r.BusinessPrompt, &r.GreetingMessage, &r.FallbackMessage, &r.VoiceModel)
+	r, exists, err := s.getAgentConfigScoped(ctx, businessID)
 	if err != nil {
 		return r, err
 	}
+	if !exists {
+		return r, sql.ErrNoRows
+	}
 	return r, nil
+}
+
+func (s *sessionStore) upsertAgentConfig(ctx context.Context, businessID string, cfg AgentConfigRow) (time.Time, error) {
+	var kwParam any
+	if cfg.HasCallbackKeywords {
+		if cfg.CallbackKeywords == nil {
+			kwParam = "[]"
+		} else {
+			b, _ := json.Marshal(cfg.CallbackKeywords)
+			kwParam = string(b)
+		}
+	}
+
+	var toolsParam any
+	if len(cfg.ToolsJSON) > 0 && string(cfg.ToolsJSON) != "null" {
+		toolsParam = string(cfg.ToolsJSON)
+	}
+
+	var updatedAt time.Time
+	err := s.db.QueryRowContext(ctx, `
+		INSERT INTO whatsapp_infra.agent_configs (
+			business_id, platform, business_prompt, greeting_message, fallback_message, voice_model,
+			voice_enabled, auto_answer, auto_callback, max_call_seconds, timezone, callback_keywords, tools_json, updated_at
+		) VALUES (
+			$1::uuid, $2, $3, $4, $5, $6,
+			$7, $8, $9, $10, NULLIF($11, ''), $12::jsonb, $13::jsonb, NOW()
+		)
+		ON CONFLICT (business_id) DO UPDATE SET
+			platform = EXCLUDED.platform,
+			business_prompt = EXCLUDED.business_prompt,
+			greeting_message = EXCLUDED.greeting_message,
+			fallback_message = EXCLUDED.fallback_message,
+			voice_model = EXCLUDED.voice_model,
+			voice_enabled = EXCLUDED.voice_enabled,
+			auto_answer = EXCLUDED.auto_answer,
+			auto_callback = EXCLUDED.auto_callback,
+			max_call_seconds = EXCLUDED.max_call_seconds,
+			timezone = EXCLUDED.timezone,
+			callback_keywords = EXCLUDED.callback_keywords,
+			tools_json = EXCLUDED.tools_json,
+			updated_at = NOW()
+		RETURNING updated_at
+	`,
+		businessID, cfg.Platform, cfg.BusinessPrompt, cfg.GreetingMessage, cfg.FallbackMessage, cfg.VoiceModel,
+		cfg.VoiceEnabled, cfg.AutoAnswer, cfg.AutoCallback, cfg.MaxCallSeconds, cfg.Timezone, kwParam, toolsParam,
+	).Scan(&updatedAt)
+	return updatedAt, err
+}
+
+func (s *sessionStore) deleteAgentConfig(ctx context.Context, businessID, platform string) (bool, error) {
+	res, err := s.db.ExecContext(ctx, `
+		DELETE FROM whatsapp_infra.agent_configs
+		WHERE business_id = $1::uuid AND COALESCE(platform, 'local') = $2
+	`, businessID, platform)
+	if err != nil {
+		return false, err
+	}
+	n, _ := res.RowsAffected()
+	return n > 0, nil
 }

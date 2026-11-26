@@ -81,12 +81,12 @@ func TestPCMConversionEdgeCases(t *testing.T) {
 		0.0,
 		1.0,
 		-1.0,
-		2.5,                     // Should clip to +MaxInt16
-		-3.8,                    // Should clip to -MinInt16
-		float32(math.NaN()),     // Must not panic, must be 0
-		float32(math.Inf(1)),    // Should clip to +MaxInt16
-		float32(math.Inf(-1)),   // Should clip to -MinInt16
-		0.00003,                 // Tiny subnormal
+		2.5,                   // Should clip to +MaxInt16
+		-3.8,                  // Should clip to -MinInt16
+		float32(math.NaN()),   // Must not panic, must be 0
+		float32(math.Inf(1)),  // Should clip to +MaxInt16
+		float32(math.Inf(-1)), // Should clip to -MinInt16
+		0.00003,               // Tiny subnormal
 	}
 
 	bytes := media.PCMFloat32ToInt16LE(input)
@@ -259,4 +259,3 @@ func TestGeminiLiveServerContentUnmarshaling(t *testing.T) {
 		t.Errorf("expected outputTranscription 'Hello there', got %s", msg4.ServerContent.OutputTranscription.Text)
 	}
 }
-

@@ -5,17 +5,18 @@ import (
 	"database/sql"
 	"log/slog"
 
+	_ "github.com/lib/pq"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	waLog "go.mau.fi/whatsmeow/util/log"
-	_ "github.com/lib/pq"
 )
 
 type server struct {
-	broker      *Broker
-	sessions    *SessionManager
-
-	log         *slog.Logger
-	staticDir   string
+	broker    *Broker
+	sessions  *SessionManager
+	outbox    *OutboxDispatcher
+	apiKeys   map[string]string
+	log       *slog.Logger
+	staticDir string
 }
 
 func openDB(dsn string) (*sql.DB, error) {
@@ -47,12 +48,20 @@ func newServer(ctx context.Context, dbPath, staticDir string, maxCalls int, log 
 		waLogger = waLog.Stdout("WA", "INFO", true)
 	}
 
+	outbox := newOutboxDispatcher(ctx, db, log)
 	broker := NewBroker()
 	broker.setStore(store)
-	mgr := newSessionManager(ctx, container, broker, store, waLogger, log, maxCalls)
+	mgr := newSessionManager(ctx, container, broker, store, outbox, waLogger, log, maxCalls)
 	broker.SnapshotFn = mgr.snapshotEvents
 
 	startScheduler(ctx, db, mgr, log)
 
-	return &server{broker: broker, sessions: mgr, log: log, staticDir: staticDir}, nil
+	return &server{
+		broker:    broker,
+		sessions:  mgr,
+		outbox:    outbox,
+		apiKeys:   loadPlatformAPIKeys(),
+		log:       log,
+		staticDir: staticDir,
+	}, nil
 }

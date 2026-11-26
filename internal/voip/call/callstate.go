@@ -19,20 +19,20 @@ type CallStateData struct {
 }
 
 type CallInfo struct {
-	CallID          string
-	PeerJid         string
-	CallCreator     string
-	Direction       core.CallDirection
-	MediaType       core.CallMediaType
-	StateData       CallStateData
-	CreatedAt       time.Time
-	GroupJid        string
+	CallID            string
+	PeerJid           string
+	CallCreator       string
+	Direction         core.CallDirection
+	MediaType         core.CallMediaType
+	StateData         CallStateData
+	CreatedAt         time.Time
+	GroupJid          string
 	IsOffline         bool
 	CallerPn          string
 	EncryptionKey     []byte
 	PeerEncryptionKey []byte
 	RelayData         *core.RelayData
-	ElectedRelayIdx *int
+	ElectedRelayIdx   *int
 }
 
 func NewOutgoingCall(callID, peerJid, ourJid string, mediaType core.CallMediaType) *CallInfo {

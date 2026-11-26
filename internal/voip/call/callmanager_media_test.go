@@ -94,4 +94,3 @@ func TestOutboundCallPromotesFromRingingToActive(t *testing.T) {
 		t.Fatalf("expected call to remain active, got %s", call.StateData.State)
 	}
 }
-

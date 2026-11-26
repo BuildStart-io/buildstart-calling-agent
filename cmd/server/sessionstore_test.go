@@ -1,55 +1,59 @@
 package main
 
 import (
-	"context"
-	"database/sql"
-	"path/filepath"
+	"strings"
 	"testing"
 )
 
-func TestSessionStoreRoundtrip(t *testing.T) {
-	ctx := context.Background()
-	dbPath := filepath.Join(t.TempDir(), "sessions_test.db")
-	db, err := sql.Open("sqlite", "file:"+dbPath)
-	if err != nil {
-		t.Fatal(err)
+func TestBuildListCallHistoryQueryPlaceholders(t *testing.T) {
+	q1, a1 := buildListCallHistoryQuery("", "", 50)
+	if strings.Contains(q1, "WHERE") {
+		t.Fatalf("expected no WHERE clause when filters empty, got: %s", q1)
 	}
-	defer db.Close()
-
-	st, err := newSessionStore(ctx, db)
-	if err != nil {
-		t.Fatal(err)
+	if !strings.Contains(q1, "LIMIT $1") || len(a1) != 1 || a1[0] != 50 {
+		t.Fatalf("expected LIMIT $1 with arg 50, got query=%s args=%v", q1, a1)
 	}
 
-	id := newSessionID()
-	if len(id) != 32 {
-		t.Fatalf("session id should be 32 hex chars, got %d", len(id))
+	q2, a2 := buildListCallHistoryQuery("global", "sess_abc", 25)
+	if !strings.Contains(q2, "COALESCE(ws.platform, 'local') = $1") ||
+		!strings.Contains(q2, "cl.session_id = $2") ||
+		!strings.Contains(q2, "LIMIT $3") {
+		t.Fatalf("unexpected placeholder numbering: %s", q2)
 	}
-	if err := st.insert(ctx, id, "Account A"); err != nil {
-		t.Fatal(err)
-	}
-
-	rows, err := st.list(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(rows) != 1 || rows[0].ID != id || rows[0].Name != "Account A" || rows[0].JID != "" {
-		t.Fatalf("unexpected rows after insert: %+v", rows)
+	if len(a2) != 3 || a2[0] != "global" || a2[1] != "sess_abc" || a2[2] != 25 {
+		t.Fatalf("unexpected args: %v", a2)
 	}
 
-	if err := st.setJID(ctx, id, "5511999999999:1@s.whatsapp.net"); err != nil {
-		t.Fatal(err)
+	q3, a3 := buildListCallHistoryQuery("local", "", 10)
+	if !strings.Contains(q3, "COALESCE(ws.platform, 'local') = $1") || !strings.Contains(q3, "LIMIT $2") {
+		t.Fatalf("unexpected single-filter query: %s", q3)
 	}
-	rows, _ = st.list(ctx)
-	if rows[0].JID != "5511999999999:1@s.whatsapp.net" {
-		t.Fatalf("jid not persisted: %+v", rows[0])
+	if len(a3) != 2 || a3[0] != "local" || a3[1] != 10 {
+		t.Fatalf("unexpected args: %v", a3)
 	}
+}
 
-	if err := st.delete(ctx, id); err != nil {
-		t.Fatal(err)
+func TestIsValidUUID(t *testing.T) {
+	if !isValidUUID("11111111-2222-3333-4444-555555555555") {
+		t.Fatal("expected valid UUID to pass")
 	}
-	rows, _ = st.list(ctx)
-	if len(rows) != 0 {
-		t.Fatalf("expected empty after delete, got %+v", rows)
+	for _, bad := range []string{"", "not-a-uuid", "11111111-2222-3333-4444-55555555555", "default-business-id"} {
+		if isValidUUID(bad) {
+			t.Fatalf("expected invalid UUID %q to fail", bad)
+		}
+	}
+}
+
+func TestResolveTargetJID(t *testing.T) {
+	j, err := resolveTargetJID("+94771234567")
+	if err != nil || j.String() != "94771234567@s.whatsapp.net" {
+		t.Fatalf("unexpected phone JID: %v %v", j, err)
+	}
+	g, err := resolveTargetJID("12036301234567890@g.us")
+	if err != nil || g.String() != "12036301234567890@g.us" {
+		t.Fatalf("unexpected group JID: %v %v", g, err)
+	}
+	if _, err := resolveTargetJID("status@broadcast"); err == nil {
+		t.Fatal("expected broadcast JID to be rejected")
 	}
 }

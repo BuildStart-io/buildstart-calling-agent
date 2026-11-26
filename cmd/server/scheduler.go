@@ -32,17 +32,32 @@ func startScheduler(ctx context.Context, db *sql.DB, mgr *SessionManager, log *s
 }
 
 func processScheduledCalls(ctx context.Context, db *sql.DB, mgr *SessionManager, log *slog.Logger) {
-	rows, err := db.QueryContext(ctx, `
-		SELECT id, business_id::text, phone_number 
-		FROM whatsapp_infra.scheduled_calls 
-		WHERE status = 'pending' AND scheduled_time <= NOW()
-		FOR UPDATE SKIP LOCKED
-	`)
+	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
-		log.Error("failed to query scheduled calls", "err", err)
+		log.Error("failed to begin scheduler transaction", "err", err)
 		return
 	}
-	defer rows.Close()
+
+	rows, err := tx.QueryContext(ctx, `
+		WITH due AS (
+			SELECT id
+			FROM whatsapp_infra.scheduled_calls
+			WHERE status = 'pending' AND scheduled_time <= NOW()
+			ORDER BY scheduled_time ASC
+			LIMIT 20
+			FOR UPDATE SKIP LOCKED
+		)
+		UPDATE whatsapp_infra.scheduled_calls sc
+		SET status = 'calling', updated_at = NOW()
+		FROM due
+		WHERE sc.id = due.id
+		RETURNING sc.id::text, sc.business_id::text, sc.phone_number
+	`)
+	if err != nil {
+		_ = tx.Rollback()
+		log.Error("failed to claim scheduled calls", "err", err)
+		return
+	}
 
 	var calls []ScheduledCall
 	for rows.Next() {
@@ -51,49 +66,53 @@ func processScheduledCalls(ctx context.Context, db *sql.DB, mgr *SessionManager,
 			calls = append(calls, c)
 		}
 	}
-	rows.Close()
+	_ = rows.Close()
+	if err := tx.Commit(); err != nil {
+		log.Error("failed to commit scheduler claim transaction", "err", err)
+		return
+	}
 
 	for _, c := range calls {
-		// Find session for this business_id
+		// Strict tenant isolation: never fall back to another business's WhatsApp session.
 		var targetSession *Session
 		for _, s := range mgr.allSessions() {
-			if s.businessID == c.BusinessID {
+			if s.businessID == c.BusinessID && s.client != nil && s.client.IsConnected() {
 				targetSession = s
 				break
 			}
 		}
 
 		if targetSession == nil {
-			for _, s := range mgr.allSessions() {
-				if s.client != nil && s.client.IsConnected() {
-					targetSession = s
-					break
-				}
-			}
-		}
-
-		if targetSession == nil {
 			log.Warn("no active session for scheduled call", "business_id", c.BusinessID, "call_id", c.ID)
-			updateScheduledCallStatus(ctx, db, c.ID, "failed_no_session")
+			updateScheduledCallOutcome(ctx, db, c.ID, "failed_no_session", "", "no connected whatsapp session for business_id")
 			continue
 		}
 
-		// Prepare JID: clean phone number of '+', spaces, and dashes
-		phone := strings.TrimPrefix(strings.ReplaceAll(strings.ReplaceAll(c.PhoneNumber, " ", ""), "-", ""), "+")
+		phone := normalizePhone(strings.TrimSpace(c.PhoneNumber))
+		if phone == "" {
+			updateScheduledCallOutcome(ctx, db, c.ID, "failed_invalid_number", "", "empty phone number")
+			continue
+		}
 		peer := types.NewJID(phone, types.DefaultUserServer)
 
-		// Start outbound call
-		_, err := targetSession.startOutgoing(ctx, peer, false)
+		callID, err := targetSession.startOutgoing(ctx, peer, false)
 		if err != nil {
-			log.Error("failed to start scheduled call", "business_id", c.BusinessID, "call_id", c.ID, "err", err)
-			updateScheduledCallStatus(ctx, db, c.ID, "failed_dial_error")
+			log.Error("failed to start scheduled call", "business_id", c.BusinessID, "id", c.ID, "err", err)
+			updateScheduledCallOutcome(ctx, db, c.ID, "failed_dial_error", "", err.Error())
 		} else {
-			log.Info("successfully dialed scheduled call", "business_id", c.BusinessID, "call_id", c.ID)
-			updateScheduledCallStatus(ctx, db, c.ID, "completed")
+			log.Info("successfully dialed scheduled call", "business_id", c.BusinessID, "id", c.ID, "call_id", callID)
+			updateScheduledCallOutcome(ctx, db, c.ID, "completed", callID, "")
 		}
 	}
 }
 
-func updateScheduledCallStatus(ctx context.Context, db *sql.DB, id, status string) {
-	_, _ = db.ExecContext(ctx, "UPDATE whatsapp_infra.scheduled_calls SET status = $1, updated_at = NOW() WHERE id = $2", status, id)
+func updateScheduledCallOutcome(ctx context.Context, db *sql.DB, id, status, callID, errMsg string) {
+	_, _ = db.ExecContext(ctx, `
+		UPDATE whatsapp_infra.scheduled_calls
+		SET status = $1,
+		    call_id = NULLIF($2, ''),
+		    error_message = NULLIF($3, ''),
+		    updated_at = NOW()
+		WHERE id = $4::uuid
+	`, status, callID, errMsg, id)
 }

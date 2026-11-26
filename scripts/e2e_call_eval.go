@@ -81,6 +81,7 @@ func main() {
 		"models/gemini-3.1-flash-live-preview",
 		"Aoede",
 		"", // uses built-in Sinhala sales prompt
+		"", // greetingMessage
 		logger.With("component", "gemini_live"),
 	)
 

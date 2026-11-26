@@ -2,6 +2,7 @@ package main
 
 import (
 	"sync"
+	"time"
 
 	"wacalls/internal/agent"
 	"wacalls/internal/voip/call"
@@ -9,18 +10,66 @@ import (
 	"go.mau.fi/whatsmeow/types"
 )
 
+type ToolInvocationRecord struct {
+	Name       string         `json:"name"`
+	Args       map[string]any `json:"args,omitempty"`
+	Result     map[string]any `json:"result,omitempty"`
+	DurationMs int64          `json:"duration_ms"`
+	Error      string         `json:"error,omitempty"`
+}
+
 type activeCall struct {
 	cm                *call.CallManager
 	bridge            *Bridge
 	geminiLive        *agent.GeminiLiveAgent
 	callbackJID       types.JID
+	peerNum           string
+	callDirection     string
 	peerAudioReceived bool
 	audioListenersMu  sync.Mutex
 	audioListeners    map[int]func([]float32)
 	nextListenerID    int
 	greetingMessage   string
 	fallbackMessage   string
+	maxCallSeconds    int
 	recorder          *CallAudioRecorder
+
+	durationMu  sync.Mutex
+	warnTimer   *time.Timer
+	cutoffTimer *time.Timer
+
+	toolsMu         sync.Mutex
+	toolInvocations []ToolInvocationRecord
+}
+
+func (ac *activeCall) recordToolInvocation(rec ToolInvocationRecord) {
+	ac.toolsMu.Lock()
+	ac.toolInvocations = append(ac.toolInvocations, rec)
+	ac.toolsMu.Unlock()
+}
+
+func (ac *activeCall) getToolInvocations() []ToolInvocationRecord {
+	ac.toolsMu.Lock()
+	defer ac.toolsMu.Unlock()
+	if len(ac.toolInvocations) == 0 {
+		return nil
+	}
+	out := make([]ToolInvocationRecord, len(ac.toolInvocations))
+	copy(out, ac.toolInvocations)
+	return out
+}
+
+func (ac *activeCall) cancelDurationTimers() {
+	ac.durationMu.Lock()
+	if ac.warnTimer != nil {
+		ac.warnTimer.Stop()
+		ac.warnTimer = nil
+	}
+	if ac.cutoffTimer != nil {
+		ac.cutoffTimer.Stop()
+		ac.cutoffTimer = nil
+	}
+	ac.durationMu.Unlock()
 }
 
 func (ac *activeCall) PushAudio(pcm []float32) {
@@ -128,4 +177,3 @@ func (r *callRegistry) all() []*activeCall {
 	}
 	return out
 }
-

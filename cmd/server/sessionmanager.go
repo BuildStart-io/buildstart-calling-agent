@@ -13,29 +13,31 @@ import (
 )
 
 type SessionManager struct {
-	appCtx      context.Context
-	container   *sqlstore.Container
-	broker      *Broker
-	store       *sessionStore
-	waLogger    waLog.Logger
-	log         *slog.Logger
-	maxCalls    int
+	appCtx    context.Context
+	container *sqlstore.Container
+	broker    *Broker
+	store     *sessionStore
+	outbox    *OutboxDispatcher
+	waLogger  waLog.Logger
+	log       *slog.Logger
+	maxCalls  int
 
 	mu       sync.RWMutex
 	sessions map[string]*Session
 	order    []string
 }
 
-func newSessionManager(ctx context.Context, container *sqlstore.Container, broker *Broker, store *sessionStore, waLogger waLog.Logger, log *slog.Logger, maxCalls int) *SessionManager {
+func newSessionManager(ctx context.Context, container *sqlstore.Container, broker *Broker, store *sessionStore, outbox *OutboxDispatcher, waLogger waLog.Logger, log *slog.Logger, maxCalls int) *SessionManager {
 	return &SessionManager{
-		appCtx:      ctx,
-		container:   container,
-		broker:      broker,
-		store:       store,
-		waLogger:    waLogger,
-		log:         log,
-		maxCalls:    maxCalls,
-		sessions:    map[string]*Session{},
+		appCtx:    ctx,
+		container: container,
+		broker:    broker,
+		store:     store,
+		outbox:    outbox,
+		waLogger:  waLogger,
+		log:       log,
+		maxCalls:  maxCalls,
+		sessions:  map[string]*Session{},
 	}
 }
 
@@ -65,11 +67,34 @@ func (m *SessionManager) Get(id string) (*Session, bool) {
 	return s, ok
 }
 
-func (m *SessionManager) infos() []SessionInfo {
+func (m *SessionManager) GetForPlatform(id, platform string) (*Session, bool) {
+	s, ok := m.Get(id)
+	if !ok || (platform != "" && s.platform != platform) {
+		return nil, false
+	}
+	return s, true
+}
+
+func (m *SessionManager) findByBusinessLocked(businessID string) *Session {
+	for _, id := range m.order {
+		if s, ok := m.sessions[id]; ok && s.businessID == businessID {
+			return s
+		}
+	}
+	return nil
+}
+
+func (m *SessionManager) infosForPlatform(platform, businessID string) []SessionInfo {
 	m.mu.RLock()
 	ordered := make([]*Session, 0, len(m.order))
 	for _, id := range m.order {
 		if s, ok := m.sessions[id]; ok {
+			if platform != "" && s.platform != platform {
+				continue
+			}
+			if businessID != "" && s.businessID != businessID {
+				continue
+			}
 			ordered = append(ordered, s)
 		}
 	}
@@ -79,6 +104,10 @@ func (m *SessionManager) infos() []SessionInfo {
 		out = append(out, s.info())
 	}
 	return out
+}
+
+func (m *SessionManager) infos() []SessionInfo {
+	return m.infosForPlatform("", "")
 }
 
 func (m *SessionManager) allSessions() []*Session {
@@ -91,8 +120,17 @@ func (m *SessionManager) allSessions() []*Session {
 	return out
 }
 
-func (m *SessionManager) snapshotEvents() []any {
-	infos := m.infos()
+func (m *SessionManager) snapshotEvents(platform, sessionID, businessID string) []any {
+	infos := m.infosForPlatform(platform, businessID)
+	if sessionID != "" {
+		filtered := make([]SessionInfo, 0, 1)
+		for _, info := range infos {
+			if info.ID == sessionID {
+				filtered = append(filtered, info)
+			}
+		}
+		infos = filtered
+	}
 	events := []any{map[string]any{"type": "session-list", "sessions": infos}}
 	for _, info := range infos {
 		if info.QR != "" {
@@ -125,33 +163,61 @@ func (m *SessionManager) Restore(ctx context.Context) error {
 			continue
 		}
 		client := whatsmeow.NewClient(device, m.waLogger)
-		s := newSession(m, row.ID, row.BusinessID, client)
+		s := newSession(m, row.ID, row.BusinessID, row.Platform, client)
 		m.register(s)
 		if err := s.connect(ctx); err != nil {
 			m.log.Error("session connect failed", "session", row.ID, "err", err)
 		}
 	}
-	m.broker.emitSessionList(m.infos())
+	m.broker.emitSessionListForPlatform(m.infos())
 	m.log.Info("sessions restored", "count", len(m.infos()))
 	return nil
 }
 
-func (m *SessionManager) Create(businessID string) (string, error) {
+var errPlatformMismatch = fmt.Errorf("resource belongs to another platform")
+
+// Create idempotently ensures a single WhatsApp session exists for (platform, businessID).
+func (m *SessionManager) Create(platform, businessID string) (string, bool, error) {
+	if platform == "" {
+		platform = "local"
+	}
+
+	m.mu.Lock()
+	if existing := m.findByBusinessLocked(businessID); existing != nil {
+		m.mu.Unlock()
+		if existing.platform != platform {
+			return "", false, errPlatformMismatch
+		}
+		return existing.id, true, nil
+	}
+
+	if cfg, exists, err := m.store.getAgentConfigScoped(m.appCtx, businessID); err != nil {
+		m.mu.Unlock()
+		return "", false, err
+	} else if exists && cfg.Platform != platform {
+		m.mu.Unlock()
+		return "", false, errPlatformMismatch
+	}
+
 	id := newSessionID()
-	if err := m.store.insert(m.appCtx, id, businessID); err != nil {
-		return "", err
+	if err := m.store.insert(m.appCtx, id, businessID, platform); err != nil {
+		m.mu.Unlock()
+		return "", false, err
 	}
 	device := m.container.NewDevice()
 	client := whatsmeow.NewClient(device, m.waLogger)
-	s := newSession(m, id, businessID, client)
-	m.register(s)
-	m.broker.emitSessionList(m.infos())
+	s := newSession(m, id, businessID, platform, client)
+	m.sessions[s.id] = s
+	m.order = append(m.order, s.id)
+	m.mu.Unlock()
+
+	m.broker.emitSessionListForPlatform(m.infosForPlatform(platform, ""))
 	if err := s.startPairing(m.appCtx); err != nil {
 		m.log.Error("start pairing failed", "session", id, "err", err)
-		return "", fmt.Errorf("start pairing: %w", err)
+		return "", false, fmt.Errorf("start pairing: %w", err)
 	}
-	m.log.Info("session created", "session", id, "businessID", businessID)
-	return id, nil
+	m.log.Info("session created", "session", id, "businessID", businessID, "platform", platform)
+	return id, false, nil
 }
 
 func (m *SessionManager) Delete(ctx context.Context, id string) error {
@@ -173,8 +239,12 @@ func (m *SessionManager) Delete(ctx context.Context, id string) error {
 	s.teardownAllCalls()
 	m.unregister(id)
 	_ = m.store.delete(ctx, id)
-	m.broker.emitSessionList(m.infos())
-	m.log.Info("session deleted", "session", id)
+	m.broker.emitSessionListForPlatform(m.infosForPlatform(s.platform, ""))
+	s.enqueueGlobalEvent(context.Background(), s.id, "session.status", map[string]any{
+		"state": "deleted",
+		"jid":   "",
+	})
+	m.log.Info("session deleted", "session", id, "platform", s.platform)
 	return nil
 }
 
@@ -207,7 +277,7 @@ func (m *SessionManager) Pair(id string) error {
 	if err := s.startPairing(m.appCtx); err != nil {
 		return fmt.Errorf("start pairing: %w", err)
 	}
-	m.broker.emitSessionList(m.infos())
+	m.broker.emitSessionListForPlatform(m.infosForPlatform(s.platform, ""))
 	m.log.Info("session re-pairing", "session", id)
 	return nil
 }

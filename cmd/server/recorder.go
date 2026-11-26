@@ -5,7 +5,9 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"log/slog"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -218,13 +220,13 @@ func encodeStereoWAV(left, right []int16, sampleRate int) []byte {
 
 	// fmt subchunk
 	buf.WriteString("fmt ")
-	_ = binary.Write(&buf, binary.LittleEndian, uint32(16))                        // Subchunk1Size
-	_ = binary.Write(&buf, binary.LittleEndian, uint16(1))                         // AudioFormat (PCM = 1)
-	_ = binary.Write(&buf, binary.LittleEndian, uint16(numChannels))               // 2 channels (Stereo)
-	_ = binary.Write(&buf, binary.LittleEndian, uint32(sampleRate))                // SampleRate
-	_ = binary.Write(&buf, binary.LittleEndian, uint32(sampleRate*numChannels*2))  // ByteRate
+	_ = binary.Write(&buf, binary.LittleEndian, uint32(16))                         // Subchunk1Size
+	_ = binary.Write(&buf, binary.LittleEndian, uint16(1))                          // AudioFormat (PCM = 1)
+	_ = binary.Write(&buf, binary.LittleEndian, uint16(numChannels))                // 2 channels (Stereo)
+	_ = binary.Write(&buf, binary.LittleEndian, uint32(sampleRate))                 // SampleRate
+	_ = binary.Write(&buf, binary.LittleEndian, uint32(sampleRate*numChannels*2))   // ByteRate
 	_ = binary.Write(&buf, binary.LittleEndian, uint16(numChannels*bytesPerSample)) // BlockAlign
-	_ = binary.Write(&buf, binary.LittleEndian, uint16(16))                        // BitsPerSample
+	_ = binary.Write(&buf, binary.LittleEndian, uint16(16))                         // BitsPerSample
 
 	// data subchunk
 	buf.WriteString("data")
@@ -239,7 +241,34 @@ func encodeStereoWAV(left, right []int16, sampleRate int) []byte {
 	return buf.Bytes()
 }
 
-func uploadCallRecording(ctx context.Context, rec *CallAudioRecorder, store *sessionStore, log *slog.Logger) {
+func newMinioClientFromEnv() (*minio.Client, error) {
+	endpoint := strings.TrimSpace(os.Getenv("MINIO_ENDPOINT"))
+	accessKey := strings.TrimSpace(os.Getenv("MINIO_ACCESS_KEY"))
+	secretKey := strings.TrimSpace(os.Getenv("MINIO_SECRET_KEY"))
+	if endpoint == "" || accessKey == "" || secretKey == "" {
+		return nil, fmt.Errorf("MINIO_ENDPOINT, MINIO_ACCESS_KEY, or MINIO_SECRET_KEY not set")
+	}
+	secure := strings.EqualFold(strings.TrimSpace(os.Getenv("MINIO_USE_SSL")), "true")
+	return minio.New(endpoint, &minio.Options{
+		Creds:  credentials.NewStaticV4(accessKey, secretKey, ""),
+		Secure: secure,
+	})
+}
+
+func minioBucketForPlatform(platform string) string {
+	if platform == "global" {
+		if b := strings.TrimSpace(os.Getenv("MINIO_GLOBAL_BUCKET")); b != "" {
+			return b
+		}
+		return "call-recordings-private"
+	}
+	if b := strings.TrimSpace(os.Getenv("MINIO_BUCKET")); b != "" {
+		return b
+	}
+	return "call-recordings"
+}
+
+func uploadCallRecording(ctx context.Context, rec *CallAudioRecorder, platform, sessionID string, store *sessionStore, outbox *OutboxDispatcher, log *slog.Logger) {
 	if rec == nil {
 		return
 	}
@@ -248,48 +277,93 @@ func uploadCallRecording(ctx context.Context, rec *CallAudioRecorder, store *ses
 		return
 	}
 
-	endpoint := strings.TrimSpace(os.Getenv("MINIO_ENDPOINT"))
-	accessKey := strings.TrimSpace(os.Getenv("MINIO_ACCESS_KEY"))
-	secretKey := strings.TrimSpace(os.Getenv("MINIO_SECRET_KEY"))
-	bucket := strings.TrimSpace(os.Getenv("MINIO_BUCKET"))
-	if bucket == "" {
-		bucket = "call-recordings"
-	}
-	publicBase := strings.TrimSpace(os.Getenv("MINIO_PUBLIC_URL"))
-	if endpoint == "" || accessKey == "" || secretKey == "" || publicBase == "" {
-		log.Warn("call recording upload skipped: MINIO_ENDPOINT, MINIO_ACCESS_KEY, MINIO_SECRET_KEY, or MINIO_PUBLIC_URL not set", "call_id", rec.callID)
-		return
-	}
-
-	client, err := minio.New(endpoint, &minio.Options{
-		Creds:  credentials.NewStaticV4(accessKey, secretKey, ""),
-		Secure: false,
-	})
+	client, err := newMinioClientFromEnv()
 	if err != nil {
-		log.Error("failed to create MinIO client for recording upload", "err", err)
+		log.Warn("call recording upload skipped", "call_id", rec.callID, "reason", err.Error())
 		return
 	}
 
+	bucket := minioBucketForPlatform(platform)
 	objectName := fmt.Sprintf("%s/%s.wav", rec.businessID, rec.callID)
 	reader := bytes.NewReader(wavData)
 
 	uploadCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
+	// Ensure private bucket exists for global recordings without changing bucket policy to public.
+	if platform == "global" {
+		if exists, exErr := client.BucketExists(uploadCtx, bucket); exErr == nil && !exists {
+			_ = client.MakeBucket(uploadCtx, bucket, minio.MakeBucketOptions{})
+		}
+	}
+
 	_, err = client.PutObject(uploadCtx, bucket, objectName, reader, int64(len(wavData)), minio.PutObjectOptions{
 		ContentType: "audio/wav",
 	})
 	if err != nil {
-		log.Error("failed to upload call recording to MinIO", "object", objectName, "err", err)
+		log.Error("failed to upload call recording to MinIO", "bucket", bucket, "object", objectName, "err", err)
 		return
 	}
 
-	publicURL := fmt.Sprintf("%s/%s", strings.TrimRight(publicBase, "/"), objectName)
-	log.Info("call recording uploaded successfully", "call_id", rec.callID, "url", publicURL, "bytes", len(wavData))
+	var storedRef string
+	if platform == "global" {
+		// Private object key — never expose an unauthenticated public URL for Global recordings.
+		storedRef = "global-private:" + objectName
+		if outbox != nil {
+			_, _ = outbox.Enqueue(uploadCtx, platform, sessionID, rec.businessID, sessionID, "recording.ready", map[string]any{
+				"call_id":       rec.callID,
+				"recording_key": objectName,
+			})
+		}
+	} else {
+		publicBase := strings.TrimSpace(os.Getenv("MINIO_PUBLIC_URL"))
+		if publicBase == "" {
+			log.Warn("call recording uploaded to private local bucket because MINIO_PUBLIC_URL is unset", "call_id", rec.callID)
+			storedRef = objectName
+		} else {
+			storedRef = fmt.Sprintf("%s/%s", strings.TrimRight(publicBase, "/"), objectName)
+		}
+	}
+
+	log.Info("call recording uploaded successfully", "call_id", rec.callID, "platform", platform, "bucket", bucket, "bytes", len(wavData))
 
 	if store != nil {
-		if err := store.updateCallRecording(uploadCtx, rec.callID, publicURL); err != nil {
+		if err := store.updateCallRecording(uploadCtx, rec.callID, storedRef); err != nil {
 			log.Error("failed to update recording_url in call_logs", "call_id", rec.callID, "err", err)
 		}
 	}
+}
+
+func presignRecordingURL(ctx context.Context, platform, businessID, callID string, expiry time.Duration) (string, error) {
+	client, err := newMinioClientFromEnv()
+	if err != nil {
+		return "", err
+	}
+	bucket := minioBucketForPlatform(platform)
+	objectName := fmt.Sprintf("%s/%s.wav", businessID, callID)
+	reqParams := make(url.Values)
+	u, err := client.PresignedGetObject(ctx, bucket, objectName, expiry, reqParams)
+	if err != nil {
+		return "", err
+	}
+	return u.String(), nil
+}
+
+func openRecordingObject(ctx context.Context, platform, businessID, callID string) (io.ReadSeekCloser, minio.ObjectInfo, error) {
+	client, err := newMinioClientFromEnv()
+	if err != nil {
+		return nil, minio.ObjectInfo{}, err
+	}
+	bucket := minioBucketForPlatform(platform)
+	objectName := fmt.Sprintf("%s/%s.wav", businessID, callID)
+	obj, err := client.GetObject(ctx, bucket, objectName, minio.GetObjectOptions{})
+	if err != nil {
+		return nil, minio.ObjectInfo{}, err
+	}
+	info, err := obj.Stat()
+	if err != nil {
+		_ = obj.Close()
+		return nil, minio.ObjectInfo{}, err
+	}
+	return obj, info, nil
 }

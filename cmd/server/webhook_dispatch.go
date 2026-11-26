@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"strings"
@@ -24,8 +26,7 @@ type PostCallWebhookPayload struct {
 	Transcripts     []CallTranscriptItem `json:"transcripts"`
 }
 
-// dispatchPostCallWebhook sends a generic call.completed payload to POST_CALL_WEBHOOK_URL
-// when an answered call finishes, leaving all domain/CRM intelligence to the upstream platform.
+// dispatchPostCallWebhook preserves Local CRM's exact webhook contract on POST_CALL_WEBHOOK_URL.
 func (s *Session) dispatchPostCallWebhook(
 	callID string,
 	peerJID types.JID,
@@ -34,6 +35,9 @@ func (s *Session) dispatchPostCallWebhook(
 	durationSeconds int,
 	transcripts []CallTranscriptItem,
 ) {
+	if s.platform != "local" {
+		return
+	}
 	webhookURL := strings.TrimSpace(os.Getenv("POST_CALL_WEBHOOK_URL"))
 	if webhookURL == "" || len(transcripts) < 2 {
 		return
@@ -45,12 +49,7 @@ func (s *Session) dispatchPostCallWebhook(
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()
 
-		targetJID := peerJID
-		if targetJID.Server == "lid" {
-			if pn := s.mgr.store.getPNForLID(ctx, targetJID.User); pn != "" {
-				targetJID = types.NewJID(pn, types.DefaultUserServer)
-			}
-		}
+		targetJID := s.resolvePhoneJID(ctx, peerJID)
 
 		payload := PostCallWebhookPayload{
 			Event:           "call.completed",
@@ -95,3 +94,115 @@ func (s *Session) dispatchPostCallWebhook(
 	}()
 }
 
+// resolvePhoneJID converts a @lid JID to a phone @s.whatsapp.net JID if known.
+func (s *Session) resolvePhoneJID(ctx context.Context, jid types.JID) types.JID {
+	out := jid.ToNonAD()
+	if out.Server == "lid" || out.Server == "" {
+		if pn := s.mgr.store.getPNForLID(ctx, out.User); pn != "" {
+			out = types.NewJID(pn, types.DefaultUserServer)
+		}
+	}
+	return out
+}
+
+// enqueueGlobalEvent persists an ordered platform event in whatsapp_infra.webhook_outbox.
+func (s *Session) enqueueGlobalEvent(ctx context.Context, partitionKey, eventType string, data any) {
+	if s.platform != "global" || s.mgr == nil || s.mgr.outbox == nil {
+		return
+	}
+	if _, err := s.mgr.outbox.Enqueue(ctx, s.platform, s.id, s.businessID, partitionKey, eventType, data); err != nil {
+		s.log.Error("failed to enqueue global outbox event", "event", eventType, "err", err)
+	}
+}
+
+func platformToolsURL(platform string) (toolsURL, secret string) {
+	p := strings.ToUpper(strings.TrimSpace(platform))
+	if p == "" {
+		return "", ""
+	}
+	toolsURL = strings.TrimSpace(os.Getenv("PLATFORM_" + p + "_TOOLS_URL"))
+	if toolsURL == "" {
+		toolsURL = strings.TrimSpace(os.Getenv("PLATFORM_" + p + "_WEBHOOK_URL"))
+	}
+	secret = strings.TrimSpace(os.Getenv("PLATFORM_" + p + "_WEBHOOK_SECRET"))
+	return toolsURL, secret
+}
+
+// invokePlatformTool executes a synchronous tool.invoke call for live voice calls (timeout <= 8s).
+func (s *Session) invokePlatformTool(
+	ctx context.Context,
+	callID string,
+	callerNumber string,
+	peerJID types.JID,
+	invocationID string,
+	name string,
+	args map[string]any,
+) (map[string]any, error) {
+	toolsURL, secret := platformToolsURL(s.platform)
+	if toolsURL == "" {
+		return nil, fmt.Errorf("platform tools URL not configured")
+	}
+
+	resolvedPeer := s.resolvePhoneJID(ctx, peerJID)
+	dataPayload := map[string]any{
+		"invocation_id": invocationID,
+		"call_id":       callID,
+		"caller_number": callerNumber,
+		"peer_jid":      resolvedPeer.String(),
+		"name":          name,
+		"args":          args,
+	}
+	rawData, err := json.Marshal(dataPayload)
+	if err != nil {
+		return nil, err
+	}
+
+	env := GlobalWebhookEnvelope{
+		EventID:    newEventID(),
+		Event:      "tool.invoke",
+		OccurredAt: time.Now().UTC().Format(time.RFC3339),
+		Platform:   s.platform,
+		SessionID:  s.id,
+		BusinessID: s.businessID,
+		Data:       json.RawMessage(rawData),
+	}
+	body, err := json.Marshal(env)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, toolsURL, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if secret != "" {
+		req.Header.Set("X-Engine-Signature", signEngineWebhook(secret, time.Now().Unix(), body))
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	respBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("tool endpoint returned HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(respBytes)))
+	}
+
+	var parsed struct {
+		Result any    `json:"result"`
+		Error  string `json:"error"`
+	}
+	if err := json.Unmarshal(respBytes, &parsed); err != nil {
+		return nil, fmt.Errorf("invalid tool response json: %w", err)
+	}
+	if parsed.Error != "" {
+		return map[string]any{"error": parsed.Error}, nil
+	}
+	if m, ok := parsed.Result.(map[string]any); ok {
+		return m, nil
+	}
+	return map[string]any{"output": parsed.Result}, nil
+}
