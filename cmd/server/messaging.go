@@ -155,8 +155,8 @@ func resolveTargetJID(raw string) (types.JID, error) {
 		if err != nil {
 			return types.JID{}, fmt.Errorf("invalid JID %q: %w", raw, err)
 		}
-		if jid.Server == "broadcast" {
-			return types.JID{}, fmt.Errorf("broadcast JIDs are not supported")
+		if jid.Server == "broadcast" || jid.Server == "newsletter" {
+			return types.JID{}, fmt.Errorf("%s JIDs are not supported", jid.Server)
 		}
 		if jid.Server != types.GroupServer {
 			jid = jid.ToNonAD()
@@ -621,7 +621,7 @@ func (s *Session) handleIncomingMessage(evt *events.Message) {
 	if evt == nil || evt.Message == nil {
 		return
 	}
-	if evt.Info.Chat == types.StatusBroadcastJID || evt.Info.Chat.Server == "broadcast" {
+	if evt.Info.Chat == types.StatusBroadcastJID || evt.Info.Chat.Server == "broadcast" || evt.Info.Chat.Server == "newsletter" {
 		return
 	}
 	// Historical backfill from WhatsApp HistorySync must not trigger replies or auto-callbacks.

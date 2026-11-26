@@ -62,6 +62,7 @@ func (s *server) routes() http.Handler {
 	mux.HandleFunc("POST /api/calls", s.handleDirectDial)
 	mux.HandleFunc("POST /api/v1/calls", s.handleDirectDial)
 	mux.HandleFunc("POST /api/sessions/{sid}/calls", s.handleStartCall)
+	mux.HandleFunc("POST /api/v1/sessions/{sid}/calls", s.handleStartCall)
 
 	// Recordings (Private bucket streaming / presigned access)
 	mux.HandleFunc("GET /api/sessions/{sid}/calls/{id}/recording", s.handleSessionGetRecording)
@@ -71,6 +72,7 @@ func (s *server) routes() http.Handler {
 	mux.HandleFunc("POST /api/calls/{id}/webrtc", s.handleDirectWebRTC)
 	mux.HandleFunc("POST /api/v1/calls/{id}/webrtc", s.handleDirectWebRTC)
 	mux.HandleFunc("POST /api/sessions/{sid}/calls/{id}/webrtc", s.handleWebRTC)
+	mux.HandleFunc("POST /api/v1/sessions/{sid}/calls/{id}/webrtc", s.handleWebRTC)
 	mux.HandleFunc("GET /api/calls/{id}/audio", s.handleDirectAudioWS)
 	mux.HandleFunc("GET /api/v1/calls/{id}/audio", s.handleDirectAudioWS)
 	mux.HandleFunc("GET /ws/audio", s.handleDirectAudioWS)
@@ -79,10 +81,12 @@ func (s *server) routes() http.Handler {
 	mux.HandleFunc("POST /api/calls/{id}/accept", s.handleDirectAccept)
 	mux.HandleFunc("POST /api/v1/calls/{id}/accept", s.handleDirectAccept)
 	mux.HandleFunc("POST /api/sessions/{sid}/calls/{id}/accept", s.handleAccept)
+	mux.HandleFunc("POST /api/v1/sessions/{sid}/calls/{id}/accept", s.handleAccept)
 
 	mux.HandleFunc("POST /api/calls/{id}/reject", s.handleDirectReject)
 	mux.HandleFunc("POST /api/v1/calls/{id}/reject", s.handleDirectReject)
 	mux.HandleFunc("POST /api/sessions/{sid}/calls/{id}/reject", s.handleReject)
+	mux.HandleFunc("POST /api/v1/sessions/{sid}/calls/{id}/reject", s.handleReject)
 
 	mux.HandleFunc("POST /api/calls/{id}/hangup", s.handleDirectHangup)
 	mux.HandleFunc("POST /api/v1/calls/{id}/hangup", s.handleDirectHangup)
@@ -91,6 +95,7 @@ func (s *server) routes() http.Handler {
 	mux.HandleFunc("DELETE /api/calls/{id}", s.handleDirectHangup)
 	mux.HandleFunc("DELETE /api/v1/calls/{id}", s.handleDirectHangup)
 	mux.HandleFunc("DELETE /api/sessions/{sid}/calls/{id}", s.handleEndCall)
+	mux.HandleFunc("DELETE /api/v1/sessions/{sid}/calls/{id}", s.handleEndCall)
 
 	// History
 	mux.HandleFunc("GET /api/history", s.handleDirectHistory)
@@ -405,14 +410,23 @@ func (s *server) handleCallGet(w http.ResponseWriter, r *http.Request) {
 
 func (s *server) handleDirectDial(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		Phone     string `json:"phone"`
-		To        string `json:"to"`
-		Number    string `json:"number"`
-		Recipient string `json:"recipient"`
-		SessionID string `json:"session_id"`
-		Greeting  string `json:"initial_greeting"`
+		Phone           string `json:"phone"`
+		To              string `json:"to"`
+		Number          string `json:"number"`
+		Recipient       string `json:"recipient"`
+		SessionID       string `json:"session_id"`
+		Greeting        string `json:"greeting"`
+		InitialGreeting string `json:"initial_greeting"`
+		Context         string `json:"context"`
+		CallContext     string `json:"call_context"`
+		ClientRef       string `json:"client_ref"`
+		MaxCallSeconds  int    `json:"max_call_seconds"`
 	}
 	_ = json.NewDecoder(r.Body).Decode(&body)
+	if body.MaxCallSeconds < 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "max_call_seconds must be >= 0"})
+		return
+	}
 
 	rawPhone := body.Phone
 	if rawPhone == "" {
@@ -466,13 +480,22 @@ func (s *server) handleDirectDial(w http.ResponseWriter, r *http.Request) {
 	}
 	peer := types.NewJID(phone, types.DefaultUserServer)
 
-	var callID string
-	var err error
-	if body.Greeting != "" {
-		callID, err = sess.startOutgoingWithGreeting(r.Context(), peer, false, body.Greeting)
-	} else {
-		callID, err = sess.startOutgoing(r.Context(), peer, false)
+	greeting := strings.TrimSpace(body.Greeting)
+	if greeting == "" {
+		greeting = strings.TrimSpace(body.InitialGreeting)
 	}
+	callCtx := strings.TrimSpace(body.Context)
+	if callCtx == "" {
+		callCtx = strings.TrimSpace(body.CallContext)
+	}
+	clientRef := strings.TrimSpace(body.ClientRef)
+
+	callID, err := sess.startOutgoingWithOptions(r.Context(), peer, false, OutboundCallOptions{
+		Greeting:       greeting,
+		Context:        callCtx,
+		ClientRef:      clientRef,
+		MaxCallSeconds: body.MaxCallSeconds,
+	})
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
@@ -482,7 +505,7 @@ func (s *server) handleDirectDial(w http.ResponseWriter, r *http.Request) {
 	s.broker.upsertCall(CallRecord{
 		SessionID: sess.id, BusinessID: sess.businessID, Platform: sess.platform, CallID: callID,
 		Owner: &owner, Direction: "outbound", Peer: peer.String(),
-		PeerNumber: peerNum, StartedAt: time.Now().UnixMilli(), Status: StatusRinging,
+		PeerNumber: peerNum, ClientRef: clientRef, StartedAt: time.Now().UnixMilli(), Status: StatusRinging,
 	})
 
 	host := r.Host
@@ -491,7 +514,7 @@ func (s *server) handleDirectDial(w http.ResponseWriter, r *http.Request) {
 	}
 	streamURL := fmt.Sprintf("wss://%s/api/v1/calls/%s/audio", host, callID)
 
-	writeJSON(w, http.StatusOK, map[string]any{
+	resp := map[string]any{
 		"call_id":    callID,
 		"callId":     callID,
 		"id":         callID,
@@ -505,7 +528,11 @@ func (s *server) handleDirectDial(w http.ResponseWriter, r *http.Request) {
 			"peer":      peer.String(),
 			"streamUrl": streamURL,
 		},
-	})
+	}
+	if clientRef != "" {
+		resp["client_ref"] = clientRef
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 func (s *server) handleStartCall(w http.ResponseWriter, r *http.Request) {
@@ -721,19 +748,33 @@ func (s *server) doStartCall(sess *Session, w http.ResponseWriter, r *http.Reque
 		return
 	}
 	var body struct {
-		Phone      string `json:"phone"`
-		To         string `json:"to"`
-		Number     string `json:"number"`
-		DurationMs int    `json:"duration_ms"`
-		Record     bool   `json:"record"`
+		Phone           string `json:"phone"`
+		To              string `json:"to"`
+		Number          string `json:"number"`
+		Recipient       string `json:"recipient"`
+		Greeting        string `json:"greeting"`
+		InitialGreeting string `json:"initial_greeting"`
+		Context         string `json:"context"`
+		CallContext     string `json:"call_context"`
+		ClientRef       string `json:"client_ref"`
+		MaxCallSeconds  int    `json:"max_call_seconds"`
+		DurationMs      int    `json:"duration_ms"`
+		Record          bool   `json:"record"`
 	}
 	_ = json.NewDecoder(r.Body).Decode(&body)
+	if body.MaxCallSeconds < 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "max_call_seconds must be >= 0"})
+		return
+	}
 	rawPhone := body.Phone
 	if rawPhone == "" {
 		rawPhone = body.To
 	}
 	if rawPhone == "" {
 		rawPhone = body.Number
+	}
+	if rawPhone == "" {
+		rawPhone = body.Recipient
 	}
 	if strings.TrimSpace(rawPhone) == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "phone required"})
@@ -760,14 +801,29 @@ func (s *server) doStartCall(sess *Session, w http.ResponseWriter, r *http.Reque
 	}
 	peer := types.NewJID(phone, types.DefaultUserServer)
 
-	callID, err := sess.startOutgoing(r.Context(), peer, false)
+	greeting := strings.TrimSpace(body.Greeting)
+	if greeting == "" {
+		greeting = strings.TrimSpace(body.InitialGreeting)
+	}
+	callCtx := strings.TrimSpace(body.Context)
+	if callCtx == "" {
+		callCtx = strings.TrimSpace(body.CallContext)
+	}
+	clientRef := strings.TrimSpace(body.ClientRef)
+
+	callID, err := sess.startOutgoingWithOptions(r.Context(), peer, false, OutboundCallOptions{
+		Greeting:       greeting,
+		Context:        callCtx,
+		ClientRef:      clientRef,
+		MaxCallSeconds: body.MaxCallSeconds,
+	})
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
 	s.broker.upsertCall(CallRecord{
 		SessionID: sess.id, BusinessID: sess.businessID, Platform: sess.platform, CallID: callID,
-		Owner: &owner, Direction: "outbound", Peer: peer.String(),
+		Owner: &owner, Direction: "outbound", Peer: peer.String(), ClientRef: clientRef,
 		StartedAt: time.Now().UnixMilli(), Status: StatusRinging,
 	})
 	host := r.Host
@@ -776,7 +832,7 @@ func (s *server) doStartCall(sess *Session, w http.ResponseWriter, r *http.Reque
 	}
 	streamURL := fmt.Sprintf("wss://%s/api/v1/calls/%s/audio", host, callID)
 
-	writeJSON(w, http.StatusOK, map[string]any{
+	resp := map[string]any{
 		"call_id":    callID,
 		"callId":     callID,
 		"id":         callID,
@@ -789,7 +845,11 @@ func (s *server) doStartCall(sess *Session, w http.ResponseWriter, r *http.Reque
 			"status":    "ringing",
 			"streamUrl": streamURL,
 		},
-	})
+	}
+	if clientRef != "" {
+		resp["client_ref"] = clientRef
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 func (s *server) doWebRTC(sess *Session, w http.ResponseWriter, r *http.Request) {

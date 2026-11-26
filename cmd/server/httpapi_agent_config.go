@@ -18,6 +18,7 @@ type agentConfigPayload struct {
 	BusinessPrompt   string          `json:"business_prompt"`
 	GreetingMessage  string          `json:"greeting_message"`
 	FallbackMessage  string          `json:"fallback_message"`
+	CallbackGreeting string          `json:"callback_greeting"`
 	VoiceModel       string          `json:"voice_model"`
 	VoiceEnabled     *bool           `json:"voice_enabled"`
 	AutoAnswer       *bool           `json:"auto_answer"`
@@ -57,6 +58,7 @@ func (s *server) handleGetAgentConfig(w http.ResponseWriter, r *http.Request) {
 		"business_prompt":   cfg.BusinessPrompt,
 		"greeting_message":  cfg.GreetingMessage,
 		"fallback_message":  cfg.FallbackMessage,
+		"callback_greeting": cfg.CallbackGreeting,
 		"voice_model":       cfg.VoiceModel,
 		"voice_enabled":     cfg.VoiceEnabled,
 		"auto_answer":       cfg.AutoAnswer,
@@ -150,6 +152,7 @@ func (s *server) handlePutAgentConfig(w http.ResponseWriter, r *http.Request) {
 		BusinessPrompt:      body.BusinessPrompt,
 		GreetingMessage:     body.GreetingMessage,
 		FallbackMessage:     body.FallbackMessage,
+		CallbackGreeting:    body.CallbackGreeting,
 		VoiceModel:          voice,
 		VoiceEnabled:        voiceEnabled,
 		AutoAnswer:          autoAnswer,

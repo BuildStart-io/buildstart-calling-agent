@@ -105,14 +105,41 @@ func (s *Session) resolvePhoneJID(ctx context.Context, jid types.JID) types.JID 
 	return out
 }
 
-// enqueueGlobalEvent persists an ordered platform event in whatsapp_infra.webhook_outbox.
+// enqueueGlobalEvent persists an ordered platform event in whatsapp_infra.webhook_outbox,
+// retrying transient DB insert failures synchronously briefly and then asynchronously so events are not dropped.
 func (s *Session) enqueueGlobalEvent(ctx context.Context, partitionKey, eventType string, data any) {
 	if s.platform != "global" || s.mgr == nil || s.mgr.outbox == nil {
 		return
 	}
-	if _, err := s.mgr.outbox.Enqueue(ctx, s.platform, s.id, s.businessID, partitionKey, eventType, data); err != nil {
-		s.log.Error("failed to enqueue global outbox event", "event", eventType, "err", err)
+	var lastErr error
+	syncDelays := []time.Duration{0, 50 * time.Millisecond, 150 * time.Millisecond}
+	for _, d := range syncDelays {
+		if d > 0 {
+			time.Sleep(d)
+		}
+		attemptCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		_, err := s.mgr.outbox.Enqueue(attemptCtx, s.platform, s.id, s.businessID, partitionKey, eventType, data)
+		cancel()
+		if err == nil {
+			return
+		}
+		lastErr = err
 	}
+	s.log.Warn("outbox insert failed synchronously; retrying asynchronously", "event", eventType, "err", lastErr)
+	go func() {
+		for _, delay := range []time.Duration{1 * time.Second, 2 * time.Second, 5 * time.Second, 15 * time.Second} {
+			time.Sleep(delay)
+			attemptCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			_, err := s.mgr.outbox.Enqueue(attemptCtx, s.platform, s.id, s.businessID, partitionKey, eventType, data)
+			cancel()
+			if err == nil {
+				s.log.Info("outbox insert succeeded on background retry", "event", eventType)
+				return
+			}
+			lastErr = err
+		}
+		s.log.Error("failed to enqueue global outbox event after retries", "event", eventType, "err", lastErr)
+	}()
 }
 
 func platformToolsURL(platform string) (toolsURL, secret string) {
@@ -134,6 +161,7 @@ func (s *Session) invokePlatformTool(
 	callID string,
 	callerNumber string,
 	peerJID types.JID,
+	clientRef string,
 	invocationID string,
 	name string,
 	args map[string]any,
@@ -151,6 +179,9 @@ func (s *Session) invokePlatformTool(
 		"peer_jid":      resolvedPeer.String(),
 		"name":          name,
 		"args":          args,
+	}
+	if clientRef != "" {
+		dataPayload["client_ref"] = clientRef
 	}
 	rawData, err := json.Marshal(dataPayload)
 	if err != nil {

@@ -289,6 +289,7 @@ type AgentConfigRow struct {
 	BusinessPrompt      string
 	GreetingMessage     string
 	FallbackMessage     string
+	CallbackGreeting    string
 	VoiceModel          string
 	VoiceEnabled        bool
 	AutoAnswer          bool
@@ -321,6 +322,7 @@ func (s *sessionStore) getAgentConfigScoped(ctx context.Context, businessID stri
 		       COALESCE(business_prompt, ''),
 		       COALESCE(greeting_message, ''),
 		       COALESCE(fallback_message, ''),
+		       COALESCE(callback_greeting, ''),
 		       COALESCE(voice_model, 'models/gemini-3.1-flash-live-preview'),
 		       COALESCE(voice_enabled, true),
 		       COALESCE(auto_answer, true),
@@ -333,7 +335,7 @@ func (s *sessionStore) getAgentConfigScoped(ctx context.Context, businessID stri
 		FROM whatsapp_infra.agent_configs
 		WHERE business_id = $1::uuid
 	`, businessID).Scan(
-		&r.Platform, &r.BusinessPrompt, &r.GreetingMessage, &r.FallbackMessage, &r.VoiceModel,
+		&r.Platform, &r.BusinessPrompt, &r.GreetingMessage, &r.FallbackMessage, &r.CallbackGreeting, &r.VoiceModel,
 		&r.VoiceEnabled, &r.AutoAnswer, &r.AutoCallback, &r.MaxCallSeconds, &tz, &kwRaw, &toolsRaw, &updatedAt,
 	)
 	if err == sql.ErrNoRows {
@@ -391,17 +393,18 @@ func (s *sessionStore) upsertAgentConfig(ctx context.Context, businessID string,
 	var updatedAt time.Time
 	err := s.db.QueryRowContext(ctx, `
 		INSERT INTO whatsapp_infra.agent_configs (
-			business_id, platform, business_prompt, greeting_message, fallback_message, voice_model,
+			business_id, platform, business_prompt, greeting_message, fallback_message, callback_greeting, voice_model,
 			voice_enabled, auto_answer, auto_callback, max_call_seconds, timezone, callback_keywords, tools_json, updated_at
 		) VALUES (
-			$1::uuid, $2, $3, $4, $5, $6,
-			$7, $8, $9, $10, NULLIF($11, ''), $12::jsonb, $13::jsonb, NOW()
+			$1::uuid, $2, $3, $4, $5, $6, $7,
+			$8, $9, $10, $11, NULLIF($12, ''), $13::jsonb, $14::jsonb, NOW()
 		)
 		ON CONFLICT (business_id) DO UPDATE SET
 			platform = EXCLUDED.platform,
 			business_prompt = EXCLUDED.business_prompt,
 			greeting_message = EXCLUDED.greeting_message,
 			fallback_message = EXCLUDED.fallback_message,
+			callback_greeting = EXCLUDED.callback_greeting,
 			voice_model = EXCLUDED.voice_model,
 			voice_enabled = EXCLUDED.voice_enabled,
 			auto_answer = EXCLUDED.auto_answer,
@@ -413,7 +416,7 @@ func (s *sessionStore) upsertAgentConfig(ctx context.Context, businessID string,
 			updated_at = NOW()
 		RETURNING updated_at
 	`,
-		businessID, cfg.Platform, cfg.BusinessPrompt, cfg.GreetingMessage, cfg.FallbackMessage, cfg.VoiceModel,
+		businessID, cfg.Platform, cfg.BusinessPrompt, cfg.GreetingMessage, cfg.FallbackMessage, cfg.CallbackGreeting, cfg.VoiceModel,
 		cfg.VoiceEnabled, cfg.AutoAnswer, cfg.AutoCallback, cfg.MaxCallSeconds, cfg.Timezone, kwParam, toolsParam,
 	).Scan(&updatedAt)
 	return updatedAt, err

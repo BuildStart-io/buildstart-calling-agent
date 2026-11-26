@@ -25,6 +25,7 @@ type activeCall struct {
 	callbackJID       types.JID
 	peerNum           string
 	callDirection     string
+	clientRef         string
 	peerAudioReceived bool
 	audioListenersMu  sync.Mutex
 	audioListeners    map[int]func([]float32)

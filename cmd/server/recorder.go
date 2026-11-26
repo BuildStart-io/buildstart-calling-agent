@@ -241,6 +241,13 @@ func encodeStereoWAV(left, right []int16, sampleRate int) []byte {
 	return buf.Bytes()
 }
 
+func minioRegion() string {
+	if r := strings.TrimSpace(os.Getenv("MINIO_REGION")); r != "" {
+		return r
+	}
+	return "us-east-1"
+}
+
 func newMinioClientFromEnv() (*minio.Client, error) {
 	endpoint := strings.TrimSpace(os.Getenv("MINIO_ENDPOINT"))
 	accessKey := strings.TrimSpace(os.Getenv("MINIO_ACCESS_KEY"))
@@ -250,8 +257,41 @@ func newMinioClientFromEnv() (*minio.Client, error) {
 	}
 	secure := strings.EqualFold(strings.TrimSpace(os.Getenv("MINIO_USE_SSL")), "true")
 	return minio.New(endpoint, &minio.Options{
-		Creds:  credentials.NewStaticV4(accessKey, secretKey, ""),
-		Secure: secure,
+		Creds:        credentials.NewStaticV4(accessKey, secretKey, ""),
+		Secure:       secure,
+		Region:       minioRegion(),
+		BucketLookup: minio.BucketLookupPath,
+	})
+}
+
+// newPresignMinioClientFromEnv creates an offline presigner anchored to the public storage domain
+// (e.g. storage.buildstart.io over HTTPS) so AWS SigV4 Host matches external clients through Nginx.
+func newPresignMinioClientFromEnv() (*minio.Client, error) {
+	accessKey := strings.TrimSpace(os.Getenv("MINIO_ACCESS_KEY"))
+	secretKey := strings.TrimSpace(os.Getenv("MINIO_SECRET_KEY"))
+	if accessKey == "" || secretKey == "" {
+		return nil, fmt.Errorf("MINIO_ACCESS_KEY or MINIO_SECRET_KEY not set")
+	}
+
+	endpoint := strings.TrimSpace(os.Getenv("MINIO_PRESIGN_ENDPOINT"))
+	secure := true
+	if endpoint == "" {
+		if pub := strings.TrimSpace(os.Getenv("MINIO_PUBLIC_URL")); pub != "" {
+			if u, err := url.Parse(pub); err == nil && u.Host != "" {
+				endpoint = u.Host
+				secure = strings.EqualFold(u.Scheme, "https")
+			}
+		}
+	}
+	if endpoint == "" {
+		return newMinioClientFromEnv()
+	}
+
+	return minio.New(endpoint, &minio.Options{
+		Creds:        credentials.NewStaticV4(accessKey, secretKey, ""),
+		Secure:       secure,
+		Region:       minioRegion(),
+		BucketLookup: minio.BucketLookupPath,
 	})
 }
 
@@ -335,7 +375,7 @@ func uploadCallRecording(ctx context.Context, rec *CallAudioRecorder, platform, 
 }
 
 func presignRecordingURL(ctx context.Context, platform, businessID, callID string, expiry time.Duration) (string, error) {
-	client, err := newMinioClientFromEnv()
+	client, err := newPresignMinioClientFromEnv()
 	if err != nil {
 		return "", err
 	}

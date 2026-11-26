@@ -42,6 +42,7 @@ type CallRecord struct {
 	Direction       string               `json:"direction"` // "inbound", "outbound", "auto-callback"
 	Peer            string               `json:"peer"`
 	PeerNumber      string               `json:"peerNumber"`
+	ClientRef       string               `json:"clientRef,omitempty"`
 	StartedAt       int64                `json:"startedAt"`
 	Status          CallStatus           `json:"status"`
 	ConnectedAt     *int64               `json:"connectedAt,omitempty"`

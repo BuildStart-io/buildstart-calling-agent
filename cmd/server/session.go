@@ -87,8 +87,8 @@ func geminiAPIKeyForPlatform(platform string) string {
 	return strings.TrimSpace(os.Getenv("GEMINI_API_KEY"))
 }
 
-func (s *Session) buildCallPrompt(cfg AgentConfigRow, peerNum, direction string) string {
-	if s.platform != "global" {
+func (s *Session) buildCallPrompt(cfg AgentConfigRow, peerNum, direction, callContext string) string {
+	if s.platform != "global" && strings.TrimSpace(callContext) == "" {
 		return cfg.BusinessPrompt
 	}
 	tzName := strings.TrimSpace(cfg.Timezone)
@@ -101,15 +101,30 @@ func (s *Session) buildCallPrompt(cfg AgentConfigRow, peerNum, direction string)
 		tzName = "UTC"
 	}
 	nowLoc := time.Now().In(loc)
-	header := fmt.Sprintf(
-		"[LIVE CALL CONTEXT]\nCurrent local time: %s (%s)\nTimezone: %s\nDirection: %s\nCustomer phone: %s\n[END LIVE CALL CONTEXT]\n\n",
+	var b strings.Builder
+	b.WriteString(fmt.Sprintf(
+		"[LIVE CALL CONTEXT]\nCurrent local time: %s (%s)\nTimezone: %s\nDirection: %s\nCustomer phone: %s\n",
 		nowLoc.Format("Monday, 2006-01-02 15:04:05 -07:00"),
 		tzName,
 		tzName,
 		direction,
 		peerNum,
-	)
-	return header + cfg.BusinessPrompt
+	))
+	if ctxTrim := strings.TrimSpace(callContext); ctxTrim != "" {
+		b.WriteString("Call purpose / campaign context: ")
+		b.WriteString(ctxTrim)
+		b.WriteByte('\n')
+	}
+	b.WriteString("[END LIVE CALL CONTEXT]\n\n")
+	b.WriteString(cfg.BusinessPrompt)
+	return b.String()
+}
+
+type OutboundCallOptions struct {
+	Greeting       string
+	Context        string
+	ClientRef      string
+	MaxCallSeconds int
 }
 
 func (s *Session) recordMissedEmitted(callID string) bool {
@@ -134,12 +149,13 @@ func (s *Session) recordMissedEmitted(callID string) bool {
 	return true
 }
 
-func (s *Session) createCall(callID, peerNum, direction string, preloaded *AgentConfigRow) *call.CallManager {
+func (s *Session) createCall(callID, peerNum, direction string, preloaded *AgentConfigRow, opts OutboundCallOptions) *call.CallManager {
 	cm := call.NewCallManager(wa.NewSocket(s.client), s.log.With("call_id", callID))
 	ac := &activeCall{
 		cm:            cm,
 		peerNum:       peerNum,
 		callDirection: direction,
+		clientRef:     strings.TrimSpace(opts.ClientRef),
 	}
 
 	var cfg AgentConfigRow
@@ -158,9 +174,21 @@ func (s *Session) createCall(callID, peerNum, direction string, preloaded *Agent
 	}
 
 	if cfgLoaded {
-		ac.greetingMessage = cfg.GreetingMessage
+		effectiveGreeting := cfg.GreetingMessage
+		if direction == "auto-callback" && strings.TrimSpace(cfg.CallbackGreeting) != "" {
+			effectiveGreeting = cfg.CallbackGreeting
+		}
+		if g := strings.TrimSpace(opts.Greeting); g != "" && g != "auto_callback" {
+			effectiveGreeting = g
+		}
+		effectiveMaxSec := cfg.MaxCallSeconds
+		if opts.MaxCallSeconds > 0 {
+			effectiveMaxSec = opts.MaxCallSeconds
+		}
+
+		ac.greetingMessage = effectiveGreeting
 		ac.fallbackMessage = cfg.FallbackMessage
-		ac.maxCallSeconds = cfg.MaxCallSeconds
+		ac.maxCallSeconds = effectiveMaxSec
 
 		rawKey := geminiAPIKeyForPlatform(s.platform)
 		if rawKey != "" {
@@ -173,8 +201,8 @@ func (s *Session) createCall(callID, peerNum, direction string, preloaded *Agent
 				model = "models/gemini-3.1-flash-live-preview"
 			}
 
-			prompt := s.buildCallPrompt(cfg, peerNum, direction)
-			gl := agent.NewGeminiLiveAgent(rawKey, model, voice, prompt, cfg.GreetingMessage, s.log.With("call_id", callID))
+			prompt := s.buildCallPrompt(cfg, peerNum, direction, opts.Context)
+			gl := agent.NewGeminiLiveAgent(rawKey, model, voice, prompt, effectiveGreeting, s.log.With("call_id", callID))
 
 			if len(cfg.ToolsJSON) > 0 && string(cfg.ToolsJSON) != "null" {
 				var tools []agent.ToolDeclaration
@@ -207,7 +235,7 @@ func (s *Session) createCall(callID, peerNum, direction string, preloaded *Agent
 						}
 
 						peerJID := ac.callbackJID
-						res, err := s.invokePlatformTool(ctx, callID, ac.peerNum, peerJID, fc.ID, fc.Name, fc.Args)
+						res, err := s.invokePlatformTool(ctx, callID, ac.peerNum, peerJID, ac.clientRef, fc.ID, fc.Name, fc.Args)
 						rec := ToolInvocationRecord{
 							Name:       fc.Name,
 							Args:       fc.Args,
@@ -348,11 +376,13 @@ func (s *Session) wireCall(cm *call.CallManager, callID string) {
 		var hadConversation bool
 		var peerAudioReceived bool
 		var callbackJID types.JID
+		var clientRef string
 		var toolInvocations []ToolInvocationRecord
 		if ac, ok := s.reg.get(c.CallID); ok {
 			ac.cancelDurationTimers()
 			callbackJID = ac.callbackJID
 			peerAudioReceived = ac.peerAudioReceived
+			clientRef = ac.clientRef
 			toolInvocations = ac.getToolInvocations()
 			if ac.recorder != nil {
 				rec := ac.recorder
@@ -388,7 +418,10 @@ func (s *Session) wireCall(cm *call.CallManager, callID string) {
 				if s.platform == "local" && len(existingRec.Transcripts) >= 2 {
 					s.dispatchPostCallWebhook(c.CallID, leadPeer, existingRec.PeerNumber, existingRec.Direction, durSec, existingRec.Transcripts)
 				} else if s.platform == "global" {
-					s.enqueueGlobalEvent(context.Background(), s.id+":"+resolvedPeer.String(), "call.completed", map[string]any{
+					if clientRef == "" {
+						clientRef = existingRec.ClientRef
+					}
+					payload := map[string]any{
 						"call_id":          c.CallID,
 						"peer_jid":         resolvedPeer.String(),
 						"caller_number":    existingRec.PeerNumber,
@@ -400,7 +433,11 @@ func (s *Session) wireCall(cm *call.CallManager, callID string) {
 						"end_reason":       string(c.StateData.EndReason),
 						"transcripts":      existingRec.Transcripts,
 						"tool_invocations": toolInvocations,
-					})
+					}
+					if clientRef != "" {
+						payload["client_ref"] = clientRef
+					}
+					s.enqueueGlobalEvent(context.Background(), s.id+":"+resolvedPeer.String(), "call.completed", payload)
 				}
 			}
 		} else if c.Direction == core.CallDirectionIncoming {
@@ -448,8 +485,11 @@ func (s *Session) wireCall(cm *call.CallManager, callID string) {
 						peerNum = existingRec.PeerNumber
 					}
 					startedAt = existingRec.StartedAt
+					if clientRef == "" {
+						clientRef = existingRec.ClientRef
+					}
 				}
-				s.enqueueGlobalEvent(context.Background(), s.id+":"+resolvedPeer.String(), "call.ended", map[string]any{
+				payload := map[string]any{
 					"call_id":          c.CallID,
 					"peer_jid":         resolvedPeer.String(),
 					"caller_number":    peerNum,
@@ -459,7 +499,11 @@ func (s *Session) wireCall(cm *call.CallManager, callID string) {
 					"end_reason":       string(c.StateData.EndReason),
 					"started_at":       startedAt,
 					"ended_at":         endedAt,
-				})
+				}
+				if clientRef != "" {
+					payload["client_ref"] = clientRef
+				}
+				s.enqueueGlobalEvent(context.Background(), s.id+":"+resolvedPeer.String(), "call.ended", payload)
 			}
 		}
 
@@ -488,7 +532,7 @@ func (s *Session) wireCall(cm *call.CallManager, callID string) {
 	}
 }
 
-func (s *Session) startOutgoingWithGreeting(ctx context.Context, peer types.JID, isVideo bool, customGreeting string) (string, error) {
+func (s *Session) startOutgoingWithOptions(ctx context.Context, peer types.JID, isVideo bool, opts OutboundCallOptions) (string, error) {
 	if pn := s.mgr.store.getPNForLID(ctx, peer.User); pn != "" {
 		peer = types.NewJID(pn, types.DefaultUserServer)
 	}
@@ -496,7 +540,7 @@ func (s *Session) startOutgoingWithGreeting(ctx context.Context, peer types.JID,
 	dir := "outbound"
 	trigger := "manual"
 	outcome := "Outbound Call"
-	if customGreeting != "" {
+	if opts.Greeting == "auto_callback" {
 		dir = "auto-callback"
 		trigger = "autonomous_callback"
 		outcome = "Auto-Callback In Progress"
@@ -508,7 +552,7 @@ func (s *Session) startOutgoingWithGreeting(ctx context.Context, peer types.JID,
 	}
 
 	callID := signaling.GenerateCallID()
-	cm := s.createCall(callID, peerNum, dir, preloaded)
+	cm := s.createCall(callID, peerNum, dir, preloaded, opts)
 	if ac, ok := s.reg.get(callID); ok {
 		ac.callbackJID = peer
 		if ac.geminiLive != nil && ac.geminiLive.IsEnabled() {
@@ -523,13 +567,13 @@ func (s *Session) startOutgoingWithGreeting(ctx context.Context, peer types.JID,
 	now := time.Now().UnixMilli()
 	s.mgr.broker.upsertCall(CallRecord{
 		SessionID: s.id, BusinessID: s.businessID, Platform: s.platform, CallID: callID,
-		Direction: dir, Peer: peer.String(), PeerNumber: peerNum,
+		Direction: dir, Peer: peer.String(), PeerNumber: peerNum, ClientRef: strings.TrimSpace(opts.ClientRef),
 		StartedAt: now, Status: StatusStarting, TriggerReason: trigger, Outcome: outcome,
 		Events: []CallEventLog{{
 			Timestamp: now,
 			Type:      "start",
 			Message:   fmt.Sprintf("Dialing %s (%s)", peerNum, dir),
-			Details:   customGreeting,
+			Details:   opts.Greeting,
 		}},
 	})
 	if err := cm.StartCall(ctx, callID, peer, isVideo); err != nil {
@@ -541,8 +585,12 @@ func (s *Session) startOutgoingWithGreeting(ctx context.Context, peer types.JID,
 	return callID, nil
 }
 
+func (s *Session) startOutgoingWithGreeting(ctx context.Context, peer types.JID, isVideo bool, customGreeting string) (string, error) {
+	return s.startOutgoingWithOptions(ctx, peer, isVideo, OutboundCallOptions{Greeting: customGreeting})
+}
+
 func (s *Session) startOutgoing(ctx context.Context, peer types.JID, isVideo bool) (string, error) {
-	return s.startOutgoingWithGreeting(ctx, peer, isVideo, "")
+	return s.startOutgoingWithOptions(ctx, peer, isVideo, OutboundCallOptions{})
 }
 
 func (s *Session) callForEvent(from types.JID, data *waBinary.Node) (*activeCall, bool) {
@@ -634,7 +682,7 @@ func (s *Session) onIncomingOffer(ctx context.Context, evt *events.CallOffer) {
 		return
 	}
 
-	cm := s.createCall(callID, peerNum, "inbound", &cfg)
+	cm := s.createCall(callID, peerNum, "inbound", &cfg, OutboundCallOptions{})
 	if ac, ok := s.reg.get(callID); ok {
 		ac.callbackJID = callbackJID
 	}
