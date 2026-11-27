@@ -208,3 +208,58 @@ func TestStartCallAndCallbackGreetingValidation(t *testing.T) {
 		t.Fatalf("expected 503 for unpaired mock session on /api/v1/sessions/{sid}/calls (route must match), got %d: %s", w.Code, w.Body.String())
 	}
 }
+
+func TestConsoleBasicAndCookieAuth(t *testing.T) {
+	t.Setenv("SERVE_STATIC_CONSOLE", "true")
+	t.Setenv("CONSOLE_PASSWORD", "console-pass-123")
+
+	srv := newMockHTTPServer(t)
+	handler := srv.routes()
+
+	// Unauthenticated browser request to / triggers Basic prompt
+	req := httptest.NewRequest("GET", "/", nil)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized || w.Header().Get("WWW-Authenticate") == "" {
+		t.Fatalf("expected 401 with WWW-Authenticate on /, got %d headers=%v", w.Code, w.Header())
+	}
+
+	// Unauthenticated API request still returns JSON 401 without Basic challenge
+	req = httptest.NewRequest("GET", "/api/sessions", nil)
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized || w.Header().Get("WWW-Authenticate") != "" {
+		t.Fatalf("expected JSON 401 without WWW-Authenticate on /api/sessions, got %d", w.Code)
+	}
+
+	// Valid Basic Auth as admin -> defaults to "local" + sets signed cookie
+	req = httptest.NewRequest("GET", "/api/sessions", nil)
+	req.SetBasicAuth("admin", "console-pass-123")
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 on Basic Auth /api/sessions, got %d: %s", w.Code, w.Body.String())
+	}
+	cookies := w.Result().Cookies()
+	if len(cookies) == 0 || cookies[0].Name != consoleCookieName {
+		t.Fatalf("expected %s cookie, got %+v", consoleCookieName, cookies)
+	}
+
+	// Cookie grants access to /api/sessions for local only
+	req = httptest.NewRequest("GET", "/api/sessions", nil)
+	req.AddCookie(cookies[0])
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), "sess_local_1") || strings.Contains(w.Body.String(), "sess_global_1") {
+		t.Fatalf("unexpected cookie-scoped sessions: code=%d body=%s", w.Code, w.Body.String())
+	}
+
+	// Basic Auth as user "global" sees global session only
+	req = httptest.NewRequest("GET", "/api/sessions", nil)
+	req.SetBasicAuth("global", "console-pass-123")
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), "sess_global_1") || strings.Contains(w.Body.String(), "sess_local_1") {
+		t.Fatalf("unexpected global basic-auth sessions: code=%d body=%s", w.Code, w.Body.String())
+	}
+}
